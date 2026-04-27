@@ -748,7 +748,10 @@ async def login(creds: LoginRequest):
     raise HTTPException(status_code=401, detail="Invalid credentials")
 
 @app.post("/api/call")
-async def trigger_call(req: CallRequest):
+async def trigger_call(req: CallRequest, request: Request):
+    # Derive the public base URL dynamically from the incoming request so
+    # Vobiz callback URLs always point to the correct live server (Render, ngrok, etc.)
+    dynamic_base_url = get_base_url(request)
     url = f"https://api.vobiz.ai/api/v1/Account/{VOBIZ_AUTH_ID}/Call/"
     headers = {
         "X-Auth-ID": VOBIZ_AUTH_ID,
@@ -758,9 +761,9 @@ async def trigger_call(req: CallRequest):
     payload = {
         "from": VOBIZ_FROM_NUMBER,
         "to": req.phone_number,
-        "answer_url": f"{BASE_URL}/vobiz-answer",
+        "answer_url": f"{dynamic_base_url}/vobiz-answer",
         "answer_method": "POST",
-        "hangup_url": f"{BASE_URL}/status",
+        "hangup_url": f"{dynamic_base_url}/status",
         "hangup_method": "POST"
     }
     logger.info(f"📤 Initiating call to {req.phone_number} | answer_url={payload['answer_url']}")
