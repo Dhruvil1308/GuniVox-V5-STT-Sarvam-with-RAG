@@ -1,0 +1,29 @@
+# render.yaml — Render Blueprint for GuniVox V3
+# Deploy: Connect your GitHub repo to Render, it will auto-detect this file.
+
+services:
+  - type: web
+    name: gunivox
+    runtime: python
+    plan: free
+    buildCommand: chmod +x build.sh && ./build.sh
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.12"
+      - key: VOBIZ_AUTH_ID
+        sync: false   # Set manually in Render dashboard
+      - key: VOBIZ_AUTH_TOKEN
+        sync: false
+      - key: VOBIZ_FROM_NUMBER
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: AI_PROVIDER
+        value: openai
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
+      - key: BASE_URL
+        sync: false   # Set to your Render URL: https://gunivox.onrender.com

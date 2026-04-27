@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+gunicorn
+requests
+openai
+python-dotenv
+openpyxl
+pydantic
+python-multipart
+groq
+gtts
+piper-tts
+numpy

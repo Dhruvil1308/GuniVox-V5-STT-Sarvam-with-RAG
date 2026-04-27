@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Environment (secrets are set as Render env vars)
+.env
+.env.local
+*.local
+
+# Node
+node_modules/
+dist/
+dist-ssr/
+
+# Database (recreated on each deploy)
+gunivox.db
+leads.xlsx
+
+# Audio temp files
+static/audio/
+temp_*.mp3
+temp_*.wav
+
+# Piper voice models (downloaded at build time via build.sh)
+piper_voices/*.onnx
+piper_voices/*.json
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Pytest
+.pytest_cache/

@@ -1,0 +1,7 @@
+{
+  "name": "GuniVox - Ganpat University Intelligent Voice Assistant",
+  "description": "A state-of-the-art voice agent for Ganpat University admission inquiries, providing real-time information on courses, fees, and eligibility using Gemini Live API.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
