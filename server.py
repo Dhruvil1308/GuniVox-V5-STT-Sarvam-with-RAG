@@ -1009,8 +1009,27 @@ async def get_call_status_ep(call_sid: str):
         transcript = [m for m in sessions[call_sid] if m['role'] != 'system']
     return {"call_sid": call_sid, "status": status, "transcript": transcript}
 
+# ─────────────────────────────────────────
+# HEALTH CHECK & UTILITY ROUTES
+# ─────────────────────────────────────────
+@app.get("/")
+@app.head("/")
+async def health_check():
+    """Health check endpoint for Render's probe."""
+    return JSONResponse(content={
+        "status": "ok",
+        "service": "GuniVox V3",
+        "stt": "groq-whisper-large-v3-turbo",
+        "tts": "piper" if piper_voice else "gtts",
+        "ai": f"{AI_PROVIDER}/{OPENAI_MODEL}"
+    })
+
+@app.get("/favicon.ico")
+async def favicon():
+    return Response(status_code=204)
+
 # Catch-all for unexpected Vobiz hits — MUST be last
-@app.api_route("/{path:path}", methods=["GET", "POST"])
+@app.api_route("/{path:path}", methods=["GET", "POST", "HEAD"])
 async def catch_all(request: Request, path: str):
     try:
         form_data = dict(await request.form())
