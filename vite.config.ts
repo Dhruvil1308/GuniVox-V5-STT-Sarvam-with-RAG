@@ -8,6 +8,19 @@ export default defineConfig(({ mode }) => {
       server: {
         port: 3000,
         host: '0.0.0.0',
+        // Proxy API calls to the Python backend during local dev
+        proxy: {
+          '/api': 'http://localhost:8000',
+          '/vobiz-answer': 'http://localhost:8000',
+          '/vobiz-respond': 'http://localhost:8000',
+          '/vobiz-silent': 'http://localhost:8000',
+          '/status': 'http://localhost:8000',
+          '/static': 'http://localhost:8000',
+        },
+      },
+      build: {
+        outDir: 'dist',
+        emptyOutDir: true,
       },
       plugins: [react()],
       define: {

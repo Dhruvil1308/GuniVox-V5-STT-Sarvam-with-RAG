@@ -23,4 +23,11 @@ python download_piper_voice.py
 mkdir -p static/audio
 mkdir -p piper_voices
 
+# 5. Build the React frontend
+echo ">>> Installing Node.js dependencies..."
+npm install
+
+echo ">>> Building React frontend..."
+npm run build
+
 echo "=== Build complete ==="

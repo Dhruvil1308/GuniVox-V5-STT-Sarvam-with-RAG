@@ -26,7 +26,7 @@ import {
 import { motion, AnimatePresence } from 'framer-motion';
 
 // --- CONFIGURATION ---
-const API_URL = "http://localhost:8000";
+const API_URL = "";
 
 // --- TYPES ---
 interface CallLog {

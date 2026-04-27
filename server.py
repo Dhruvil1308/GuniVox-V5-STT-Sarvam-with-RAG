@@ -133,6 +133,11 @@ app.add_middleware(
 os.makedirs("static/audio", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# Mount built React frontend assets (JS/CSS chunks)
+FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "dist")
+if os.path.isdir(os.path.join(FRONTEND_DIR, "assets")):
+    app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIR, "assets")), name="frontend_assets")
+
 # ─────────────────────────────────────────
 # DATABASE
 # ─────────────────────────────────────────
@@ -1012,10 +1017,9 @@ async def get_call_status_ep(call_sid: str):
 # ─────────────────────────────────────────
 # HEALTH CHECK & UTILITY ROUTES
 # ─────────────────────────────────────────
-@app.get("/")
-@app.head("/")
-async def health_check():
-    """Health check endpoint for Render's probe."""
+@app.get("/api/health")
+async def api_health_check():
+    """API health check endpoint."""
     return JSONResponse(content={
         "status": "ok",
         "service": "GuniVox V3",
@@ -1026,17 +1030,47 @@ async def health_check():
 
 @app.get("/favicon.ico")
 async def favicon():
+    """Serve favicon from dist/ if it exists, otherwise 204."""
+    favicon_path = os.path.join(FRONTEND_DIR, "favicon.ico")
+    if os.path.exists(favicon_path):
+        return FileResponse(favicon_path)
     return Response(status_code=204)
 
-# Catch-all for unexpected Vobiz hits — MUST be last
+
+def _serve_frontend_index():
+    """Return the React app's index.html if the dist/ build exists."""
+    index_path = os.path.join(FRONTEND_DIR, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path, media_type="text/html")
+    # Fallback JSON if frontend hasn't been built yet
+    return JSONResponse(content={
+        "status": "ok",
+        "service": "GuniVox V3 — frontend not built",
+        "hint": "Run 'npm run build' to generate the dist/ folder."
+    })
+
+
+@app.get("/")
+@app.head("/")
+async def serve_root():
+    """Serve the React frontend at root. Also satisfies Render's health probe (returns 200)."""
+    return _serve_frontend_index()
+
+
+# Catch-all: serve frontend for browser routes, log unexpected webhook hits
 @app.api_route("/{path:path}", methods=["GET", "POST", "HEAD"])
 async def catch_all(request: Request, path: str):
-    try:
-        form_data = dict(await request.form())
-    except Exception:
-        form_data = {}
-    logger.warning(f"⚠️ UNEXPECTED HIT: /{path} | method={request.method} | form={form_data}")
-    return JSONResponse(content={"received": True})
+    # POST requests to unknown paths are likely Vobiz webhook mis-hits
+    if request.method == "POST":
+        try:
+            form_data = dict(await request.form())
+        except Exception:
+            form_data = {}
+        logger.warning(f"⚠️ UNEXPECTED HIT: /{path} | method={request.method} | form={form_data}")
+        return JSONResponse(content={"received": True})
+
+    # GET/HEAD on non-API paths → serve the React SPA (client-side routing)
+    return _serve_frontend_index()
 
 if __name__ == "__main__":
     import uvicorn
