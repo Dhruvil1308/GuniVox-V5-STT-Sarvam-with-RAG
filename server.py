@@ -8,7 +8,6 @@ import struct
 from datetime import datetime
 from typing import Dict, List, Optional
 import requests
-from collections import Counter
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import Response, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,6 +22,7 @@ from openpyxl import Workbook
 from xml.sax.saxutils import escape
 
 from prompt_config import SYSTEM_PROMPT
+import faiss_rag
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -201,6 +201,20 @@ def populate_default_courses():
 
 init_db()
 
+# ─────────────────────────────────────────
+# FAISS RAG INITIALIZATION
+# ─────────────────────────────────────────
+def init_faiss_rag():
+    """Load (or build) the FAISS vector index from final_dataset.json on startup."""
+    try:
+        faiss_rag.load_index(json_path='final_dataset.json')
+        logger.info(f"✅ FAISS RAG ready — {faiss_rag._index.ntotal} vectors loaded.")
+    except Exception as e:
+        logger.error(f"❌ FAISS RAG init failed: {e}")
+
+# Load FAISS in a background thread to avoid blocking server startup
+threading.Thread(target=init_faiss_rag, daemon=True).start()
+
 # In-memory session store: call_sid → message list
 sessions: Dict[str, List[Dict[str, str]]] = {}
 
@@ -284,60 +298,36 @@ REMEMBER: NAME, INTEREST, STATUS must appear in EVERY response. Never drop these
         return SYSTEM_PROMPT
 
 
-def _tokenize_for_rag(text: str) -> Counter:
-    tokens = re.findall(r"[a-zA-Z0-9]+", (text or "").lower())
-    return Counter(tokens)
-
-
-def _score_rag_match(query_counter: Counter, text: str) -> int:
-    doc_counter = _tokenize_for_rag(text)
-    return sum(min(query_counter[t], doc_counter.get(t, 0)) for t in query_counter)
-
-
-def search_rag_documents(query: str, top_k: int = 3) -> List[Dict[str, str]]:
-    query_counter = _tokenize_for_rag(query)
-    if not query_counter:
-        return []
-
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT id, title, content, source FROM rag_documents")
-    rows = c.fetchall()
-    conn.close()
-
-    docs: List[Dict[str, str]] = []
-    for row in rows:
-        doc_id, title, content, source = row
-        score = _score_rag_match(query_counter, f"{title or ''} {content or ''}")
-        if score > 0:
-            docs.append({
-                "id": doc_id,
-                "title": title or "Untitled",
-                "content": content or "",
-                "source": source or "manual",
-                "score": score,
-            })
-
-    docs.sort(key=lambda d: d["score"], reverse=True)
-    return docs[:top_k]
-
-
 def build_rag_context(query: str) -> str:
+    """
+    Use FAISS vector search to retrieve semantically relevant programme info.
+    Returns a compact, phone-call-friendly context string injected into the LLM.
+    """
     if not ENABLE_RAG:
         return ""
 
-    hits = search_rag_documents(query, top_k=RAG_TOP_K)
-    if not hits:
+    if not faiss_rag.is_ready():
+        logger.warning("FAISS index not ready — skipping RAG retrieval.")
         return ""
 
-    parts = []
-    for i, item in enumerate(hits, start=1):
-        snippet = item["content"].strip().replace("\n", " ")
-        if len(snippet) > 500:
-            snippet = snippet[:500] + "..."
-        parts.append(f"[{i}] {item['title']} ({item['source']}): {snippet}")
+    try:
+        results = faiss_rag.search(query, top_k=RAG_TOP_K)
+        if not results:
+            logger.info(f"RAG: no relevant results for query='{query[:60]}'")
+            return ""
 
-    return "\n".join(parts)
+        parts = []
+        for hit in results:
+            score = hit['score']
+            ctx   = hit.get('voice_context') or hit['text']
+            parts.append(f"[score={score:.2f}]\n{ctx}")
+
+        context_str = "\n\n".join(parts)
+        logger.info(f"RAG: {len(results)} hit(s) for query='{query[:60]}'")
+        return context_str
+    except Exception as e:
+        logger.error(f"FAISS search error: {e}")
+        return ""
 
 
 def call_ollama_chat(messages: List[Dict[str, str]], temperature: float = 0.7, max_tokens: int = 250) -> str:
@@ -437,7 +427,10 @@ def get_ai_response(call_sid: str, user_input: str) -> Dict[str, str]:
 # XML BUILDER HELPERS
 # ─────────────────────────────────────────
 def get_base_url(request: Request) -> str:
-    """Safely extract the public base URL from the incoming request headers."""
+    """Safely extract the public base URL from the incoming request headers or env var."""
+    env_base = os.getenv("BASE_URL")
+    if env_base:
+        return env_base.rstrip('/')
     host = request.headers.get("x-forwarded-host") or request.headers.get("host")
     scheme = request.headers.get("x-forwarded-proto", "https")
     return f"{scheme}://{host}"
@@ -847,6 +840,8 @@ async def get_courses():
 
 @app.get("/api/llm/health")
 async def llm_health_check():
+    faiss_status = faiss_rag.stats()
+
     if AI_PROVIDER == "ollama":
         try:
             tags = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=10)
@@ -858,6 +853,7 @@ async def llm_health_check():
                 "configured_model": OLLAMA_MODEL,
                 "available_models": models,
                 "model_available": OLLAMA_MODEL in models,
+                "faiss": faiss_status,
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Ollama check failed: {e}")
@@ -866,6 +862,11 @@ async def llm_health_check():
         "provider": AI_PROVIDER,
         "model": OPENAI_MODEL,
         "rag_enabled": ENABLE_RAG,
+        "faiss": faiss_status,
+        # legacy flat keys for diagnostic_check.py compatibility
+        "faiss_ready": faiss_status["ready"],
+        "faiss_vectors": faiss_status["total_vectors"],
+        "embedding_model": faiss_status["model"],
     }
 
 
@@ -887,13 +888,44 @@ async def add_rag_document(doc: RagDocumentRequest):
 
 
 @app.get("/api/rag/search")
-async def rag_search(q: str, top_k: int = 3):
+async def rag_search(q: str, top_k: int = 3, threshold: float = faiss_rag.SCORE_THRESHOLD):
+    """Search the FAISS vector index for semantically similar programme records."""
     top_k = max(1, min(top_k, 10))
-    return {
-        "query": q,
-        "results": search_rag_documents(q, top_k=top_k),
-        "rag_enabled": ENABLE_RAG,
-    }
+    if not faiss_rag.is_ready():
+        return {"query": q, "results": [], "rag_enabled": ENABLE_RAG, "error": "FAISS index not loaded"}
+    try:
+        results = faiss_rag.search(q, top_k=top_k, score_threshold=threshold)
+        return {
+            "query": q,
+            "results": results,
+            "rag_enabled": ENABLE_RAG,
+            "engine": "faiss",
+            **faiss_rag.stats(),
+        }
+    except Exception as e:
+        logger.error(f"FAISS search API error: {e}")
+        return {"query": q, "results": [], "rag_enabled": ENABLE_RAG, "error": str(e)}
+
+
+@app.post("/api/rag/rebuild")
+async def rag_rebuild():
+    """Force-rebuild the FAISS index from the latest final_dataset.json."""
+    try:
+        faiss_rag.load_index(force_rebuild=True, json_path='final_dataset.json')
+        return {
+            "success": True,
+            "message": "FAISS index rebuilt successfully.",
+            **faiss_rag.stats(),
+        }
+    except Exception as e:
+        logger.error(f"FAISS rebuild error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/rag/stats")
+async def rag_stats():
+    """Return FAISS index statistics."""
+    return faiss_rag.stats()
 
 @app.post("/api/courses")
 async def add_course(course: Course):

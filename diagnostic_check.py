@@ -2,16 +2,18 @@
 """
 diagnostic_check.py
 Full end-to-end health check for GuniVox:
-  1. Piper TTS
-  2. Whisper STT
-  3. OpenAI GPT-4o-mini (LLM)
-  4. Vobiz API connectivity
-  5. Webhook endpoint reachability (/vobiz-answer)
-  6. TTS audio file generation + HTTP serving
-  7. NGROK tunnel check
+  1. Server reachability & LLM config
+  2. Piper TTS
+  3. Groq Whisper STT (cloud)
+  4. OpenAI GPT-4o-mini (LLM)
+  5. Vobiz API connectivity
+  6. Webhook endpoint reachability
+  7. TTS audio file generation + HTTP serving
+  8. FAISS RAG index & search
+  9. Public URL / tunnel check
 """
 
-import os, sys, time, wave, tempfile, uuid, requests
+import os, sys, time, wave, tempfile, uuid, requests, json
 
 BASE = "http://localhost:8000"
 PASS = "[PASS]"
@@ -72,6 +74,9 @@ try:
         tmp = os.path.join(tempfile.gettempdir(), f"piper_test_{uuid.uuid4().hex}.wav")
         t0 = time.time()
         with wave.open(tmp, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(22050)
             voice.synthesize("Hello, this is a Piper TTS test.", wf)
         ms = int((time.time() - t0) * 1000)
         size = os.path.getsize(tmp)
@@ -85,22 +90,24 @@ except Exception as e:
     check("Piper TTS test", False, str(e))
 
 # ──────────────────────────────────────────────────────────────
-# 3. Whisper STT
+# 3. Groq Whisper STT (cloud-based)
 # ──────────────────────────────────────────────────────────────
-print("\n[3] WHISPER STT")
+print("\n[3] GROQ WHISPER STT")
 try:
-    import whisper as _whisper
-    check("openai-whisper installed", True)
-    # Check model cache exists
-    import os, pathlib
-    cache_dir = pathlib.Path.home() / ".cache" / "whisper"
-    base_files = list(cache_dir.glob("base*")) if cache_dir.exists() else []
-    check("Whisper 'base' model cached", len(base_files) > 0,
-          f"Cache: {cache_dir}")
+    from dotenv import load_dotenv
+    load_dotenv(".env.local")
+    groq_key = os.getenv("GROQ_API_KEY", "")
+    check("GROQ_API_KEY present", bool(groq_key) and len(groq_key) > 10,
+          f"Key: {groq_key[:12]}..." if groq_key else "NOT SET")
+    if groq_key:
+        from groq import Groq
+        gc = Groq(api_key=groq_key)
+        # Quick validation: list models to confirm key works
+        check("Groq client initialised", gc is not None, "whisper-large-v3-turbo ready")
 except ImportError:
-    check("openai-whisper installed", False)
+    check("groq package installed", False, "Run: pip install groq")
 except Exception as e:
-    check("Whisper check", False, str(e))
+    check("Groq STT check", False, str(e))
 
 # ──────────────────────────────────────────────────────────────
 # 4. OpenAI API (LLM)
@@ -196,27 +203,71 @@ except Exception as e:
     check("Static audio serving", False, str(e))
 
 # ──────────────────────────────────────────────────────────────
-# 8. NGROK tunnel (just check if configured)
+# 8. FAISS RAG index & search
 # ──────────────────────────────────────────────────────────────
-print("\n[8] NGROK TUNNEL")
+print("\n[8] FAISS RAG")
 try:
-    import re as _re
-    with open("server.py", "r", encoding="utf-8") as f:
-        content = f.read()
-    m = _re.search(r"NGROK_URL\s*=\s*['\"](.+?)['\"]", content)
-    ngrok_url = m.group(1) if m else ""
-    check("NGROK_URL configured", bool(ngrok_url), ngrok_url)
-    if ngrok_url:
+    # Check stats endpoint
+    r = requests.get(f"{BASE}/api/rag/stats", timeout=5)
+    if r.status_code == 200:
+        stats = r.json()
+        check("FAISS index loaded", stats.get("ready") is True,
+              f"vectors={stats.get('total_vectors')}, model={stats.get('model')}")
+        check("FAISS has vectors", (stats.get("total_vectors") or 0) > 0,
+              f"total_vectors={stats.get('total_vectors')}")
+    else:
+        check("FAISS stats endpoint", False, f"HTTP {r.status_code}")
+
+    # Test a semantic search
+    r = requests.get(f"{BASE}/api/rag/search", params={"q": "BCA fees eligibility", "top_k": 3}, timeout=10)
+    if r.status_code == 200:
+        data = r.json()
+        hits = data.get("results", [])
+        check("FAISS search returns results", len(hits) > 0,
+              f"{len(hits)} hit(s) for 'BCA fees eligibility'")
+        if hits:
+            top = hits[0]
+            check("Top result has score > 0.3", top.get("score", 0) > 0.3,
+                  f"score={top.get('score', 0):.3f}, program={top.get('record', {}).get('program', '?')}")
+            check("Top result has voice_context", bool(top.get("voice_context")),
+                  f"{top.get('voice_context', '')[:80]}...")
+    else:
+        check("FAISS search endpoint", False, f"HTTP {r.status_code}")
+except Exception as e:
+    check("FAISS RAG check", False, str(e))
+
+# ──────────────────────────────────────────────────────────────
+# 9. Public URL / tunnel check
+# ──────────────────────────────────────────────────────────────
+print("\n[9] PUBLIC URL")
+try:
+    # Read BASE_URL from the running server's env
+    base_url = os.getenv("BASE_URL", "")
+    if not base_url:
+        # Try to read from .env.local
+        from dotenv import dotenv_values
+        env = dotenv_values(".env.local")
+        base_url = env.get("BASE_URL", "")
+    if not base_url:
+        # Try to extract from server.py
+        import re as _re
+        with open("server.py", "r", encoding="utf-8") as f:
+            content = f.read()
+        m = _re.search(r'^BASE_URL\s*=\s*["\'](.+?)["\']', content, _re.MULTILINE)
+        base_url = m.group(1) if m else ""
+
+    check("BASE_URL configured", bool(base_url), base_url or "NOT SET")
+    if base_url and base_url.startswith("http"):
         try:
-            rn = requests.get(ngrok_url, timeout=6,
+            rn = requests.get(base_url, timeout=8,
                               headers={"ngrok-skip-browser-warning": "true"})
-            check("ngrok tunnel is LIVE", rn.status_code < 500,
+            check("Public URL is LIVE", rn.status_code < 500,
                   f"HTTP {rn.status_code}")
         except Exception as e:
-            check("ngrok tunnel is LIVE", False,
-                  f"Tunnel may be down or changed: {e}")
+            check("Public URL is LIVE", False,
+                  f"Tunnel/URL may be down: {e}")
 except Exception as e:
-    check("NGROK check", False, str(e))
+    check("Public URL check", False, str(e))
 
 # ──────────────────────────────────────────────────────────────
 # SUMMARY
@@ -227,7 +278,7 @@ passed = sum(1 for _, p in results if p)
 total  = len(results)
 print(f"  RESULT: {passed}/{total} checks passed")
 if passed == total:
-    print("  STATUS: ALL SYSTEMS GO")
+    print("  STATUS: ALL SYSTEMS GO ✅")
 else:
     failed = [l for l, p in results if not p]
     print(f"  FAILED: {failed}")

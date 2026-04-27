@@ -11,3 +11,5 @@ groq
 gtts
 piper-tts
 numpy
+faiss-cpu
+sentence-transformers

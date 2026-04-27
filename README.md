@@ -1,20 +1,20 @@
 <div align="center">
 
-# ⚡ GuniVox V3
+# ⚡ GuniVox V3 (RAG Edition)
 
-### Ganpat University — AI-Powered Voice Admission Counselor
+### Ganpat University — AI-Powered Voice Admission Counselor with FAISS RAG
 
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
 [![React](https://img.shields.io/badge/React-19-61DAFB?style=for-the-badge&logo=react&logoColor=black)](https://react.dev)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
-[![Twilio](https://img.shields.io/badge/Twilio-Voice_API-F22F46?style=for-the-badge&logo=twilio&logoColor=white)](https://twilio.com)
+[![FAISS](https://img.shields.io/badge/Vector_DB-FAISS-00599C?style=for-the-badge&logo=faiss&logoColor=white)](https://github.com/facebookresearch/faiss)
 [![OpenAI](https://img.shields.io/badge/OpenAI-GPT--4o--mini-412991?style=for-the-badge&logo=openai&logoColor=white)](https://openai.com)
 
-**GuniVox** is an intelligent outbound voice assistant that automates admission counseling calls for **Ganpat University**. It uses **Twilio** for telephony, **OpenAI GPT-4o-mini** for conversational AI, and a modern **React + Vite** dashboard for real-time call management and analytics.
+**GuniVox V3** is an advanced outbound voice assistant for **Ganpat University** that now features a robust **RAG (Retrieval-Augmented Generation)** system using **FAISS**. It intelligently retrieves student course data and university information from a vector database to provide highly accurate, context-aware responses during admission counseling calls.
 
 ---
 
-[Features](#-features) · [Architecture](#-architecture) · [Installation](#-installation--setup) · [How to Run](#-how-to-run) · [Configuration](#%EF%B8%8F-configuration) · [API Reference](#-api-reference) · [Project Structure](#-project-structure) · [Tech Stack](#-tech-stack)
+[Features](#-features) · [Architecture](#-architecture) · [FAISS RAG Setup](#-faiss-rag-setup) · [Installation](#-installation--setup) · [How to Run](#-how-to-run) · [Configuration](#%EF%B8%8F-configuration) · [API Reference](#-api-reference) · [Project Structure](#-project-structure)
 
 </div>
 
@@ -24,6 +24,7 @@
 
 | Category | Feature |
 |---|---|
+| **🧠 FAISS RAG** | Advanced semantic search using FAISS vector index for course data |
 | **🤖 AI Voice Agent** | Human-like female Indian AI counselor with warm, friendly tone |
 | **📞 Outbound Dialer** | One-click outbound calls via Twilio Voice API from the dashboard |
 | **🗣️ Multilingual** | Automatic language detection — English (en-IN), Gujarati (gu-IN), Hindi (hi-IN) |
@@ -49,9 +50,9 @@
                         ┌──────────────┼──────────────┐
                         │              │              │
                    ┌────▼────┐  ┌──────▼─────┐  ┌────▼────┐
-                   │ Twilio  │  │  OpenAI    │  │ SQLite  │
-                   │ Voice   │  │  GPT-4o    │  │   DB    │
-                   │ API     │  │  mini      │  │         │
+                   │ Twilio  │  │  OpenAI    │  │ FAISS   │
+                   │ Voice   │  │  GPT-4o    │  │ Vector  │
+                   │ API     │  │  mini      │  │ Index   │
                    └─────────┘  └────────────┘  └─────────┘
                         │
                    ┌────▼────┐
@@ -66,11 +67,40 @@
 2. **Backend triggers Twilio** to place an outbound call to the target number.
 3. **Twilio hits the `/voice` webhook** (via Ngrok tunnel) to get the initial greeting TwiML.
 4. **User speaks → Twilio transcribes** speech and POSTs it to the `/respond` endpoint.
-5. **OpenAI generates a contextual response** using the system prompt + course database.
-6. **Response is spoken back** to the user via Twilio's text-to-speech (Google Neural2 voices).
-7. **Metadata (name, interest, lead status)** is extracted in real-time from each AI response.
-8. **When the call ends**, a full transcript analysis runs to ensure all metadata is captured.
-9. **Dashboard updates in real-time** with call status, transcript, and analytics.
+5. **Backend performs FAISS Search**: The user's speech is embedded, and relevant course/university info is retrieved from `faiss_index`.
+6. **OpenAI generates a contextual response** using the system prompt + **Retrieved RAG Context**.
+7. **Response is spoken back** to the user via Twilio's text-to-speech (Google Neural2 voices).
+8. **Metadata (name, interest, lead status)** is extracted in real-time from each AI response.
+9. **When the call ends**, a full transcript analysis runs to ensure all metadata is captured.
+10. **Dashboard updates in real-time** with call status, transcript, and analytics.
+
+---
+
+## 🧠 FAISS RAG Setup
+
+GuniVox uses a vector-based RAG system to provide accurate information about Ganpat University.
+
+### 1. The Dataset
+The raw knowledge is stored in `final_dataset.json`. This contains course details, admission policies, and university info.
+
+### 2. Building the Index
+Before running the system, you must build the FAISS vector index:
+
+```bash
+# Activate virtual environment
+.venv\Scripts\activate
+
+# Run the index builder
+python build_faiss_index.py
+```
+
+This will create a `faiss_index/` directory containing `index.faiss` and `metadata.pkl`.
+
+### 3. How it's Used
+When a call is active, the system uses `faiss_rag.py` to:
+- Convert user speech into a vector embedding.
+- Search the `faiss_index` for the most relevant information.
+- Inject that information into the AI's prompt for factual accuracy.
 
 ---
 
@@ -108,8 +138,8 @@ You also need accounts on these platforms (free tiers available):
 ### Step 1 — Clone the Repository
 
 ```bash
-git clone https://github.com/<your-username>/GuniVox_V3.git
-cd GuniVox_V3
+git clone https://github.com/Dhruvil1308/GuniVox-RAG-Implemented-Code.git
+cd GuniVox-RAG-Implemented-Code
 ```
 
 Or download the ZIP from GitHub and extract it.
@@ -139,6 +169,8 @@ This installs the following Python libraries:
 | `uvicorn` | ASGI server to run FastAPI |
 | `twilio` | Twilio Voice API SDK for making/managing calls |
 | `openai` | OpenAI SDK for GPT-4o-mini AI responses |
+| `faiss-cpu` | Vector database for semantic search |
+| `sentence-transformers` | Generates text embeddings for RAG |
 | `python-dotenv` | Loads environment variables from `.env.local` |
 | `openpyxl` | Generates Excel (`.xlsx`) reports from call data |
 | `pydantic` | Data validation for API request/response models |
