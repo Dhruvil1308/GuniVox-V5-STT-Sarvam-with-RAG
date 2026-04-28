@@ -37,22 +37,40 @@ GuniVox V5 was explicitly architected to achieve near-human conversation latency
 
 ### 📉 Latency Breakdown (Visual)
 ```mermaid
-gantt
-    title GuniVox V5 Voice Pipeline Latency Breakdown
-    dateFormat  s
-    axisFormat  %S.%L
+sequenceDiagram
+    participant User
+    participant Twilio as Vobiz/Twilio
+    participant Backend as FastAPI
+    participant STT as Sarvam AI
+    participant RAG as FAISS
+    participant LLM as GPT-4o-mini
+    participant TTS as Piper TTS
+
+    User->>Twilio: Speaks for 2s chunk
+    Twilio->>Backend: Streams Audio
     
-    section User
-    User Speaks (2s Chunk) : done, 0.0, 2.0s
+    rect rgb(200, 220, 250)
+        Backend->>STT: Send Audio
+        STT-->>Backend: Transcript (~400ms)
+    end
     
-    section Processing
-    Sarvam AI STT : active, 2.0, 0.4s
-    FAISS RAG Retrieval : active, 2.4, 0.05s
-    GPT-4o-mini LLM : active, 2.45, 0.8s
-    Piper TTS (Local ONNX) : active, 3.25, 0.15s
+    rect rgb(220, 250, 220)
+        Backend->>RAG: Embed & Search
+        RAG-->>Backend: Context (~50ms)
+    end
     
-    section Bot
-    Bot Audio Playback : 3.40, 2.0s
+    rect rgb(250, 220, 220)
+        Backend->>LLM: Prompt + Context
+        LLM-->>Backend: Response (~800ms)
+    end
+    
+    rect rgb(250, 250, 220)
+        Backend->>TTS: Generate Audio
+        TTS-->>Backend: WAV Stream (~150ms)
+    end
+    
+    Backend->>Twilio: Stream Back
+    Twilio->>User: Audio Playback (Turnaround ~1.4s)
 ```
 
 *(The entire backend cycle takes roughly **1.2 to 1.5 seconds** from the moment the user stops speaking to the moment the bot starts replying.)*
