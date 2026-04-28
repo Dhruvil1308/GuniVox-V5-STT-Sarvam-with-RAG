@@ -24,7 +24,9 @@
 
 ## ⚡ Technologies & Latency Optimization
 
-GuniVox V5 was explicitly architected to achieve near-human conversation latency (Target: < 1.5 seconds Total Turnaround Time). 
+> ⏱️ **Total Agent Response Time:** From the moment the user finishes speaking, the AI agent processes the audio, searches the knowledge base, generates an intelligent response, and begins speaking back in **~1.2 to 1.5 seconds**.
+
+GuniVox V5 was explicitly architected to achieve near-human conversation latency (Target: < 1.5 seconds Total Turnaround Time).
 
 | Pipeline Stage | Technology Used | Purpose | Avg. Latency |
 |---|---|---|---|
