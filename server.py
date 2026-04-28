@@ -3,12 +3,14 @@ import logging
 import json
 import re
 import sqlite3
+import time
 import wave
-import struct
+import csv
 from datetime import datetime
 from typing import Dict, List, Optional
+from io import StringIO
 import requests
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 from fastapi.responses import Response, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -19,34 +21,28 @@ import uuid
 import threading
 from dotenv import load_dotenv
 from openpyxl import Workbook
-from xml.sax.saxutils import escape
 
 from prompt_config import SYSTEM_PROMPT
 import faiss_rag
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "15"))
+http_session = requests.Session()
 
 load_dotenv(".env.local")
 
-# --- Groq Whisper STT Initialization ---
-# Uses Groq's ultra-fast LPU hardware to run Whisper Large-v3 Turbo
-# Supports 100+ languages including English, Hindi, Gujarati
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-groq_client = None
+# --- Sarvam AI STT Initialization ---
+# Uses Sarvam AI for fast Speech to Text processing
+SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
 
-def init_groq_stt():
-    global groq_client
-    if not GROQ_API_KEY:
-        logger.warning("⚠️  GROQ_API_KEY not set — STT will not work!")
+def init_sarvam_stt():
+    if not SARVAM_API_KEY:
+        logger.warning("⚠️  SARVAM_API_KEY not set — STT will not work!")
         return
-    try:
-        groq_client = Groq(api_key=GROQ_API_KEY)
-        logger.info("✅ Groq Whisper STT ready (whisper-large-v3-turbo, cloud).")
-    except Exception as e:
-        logger.error(f"❌ Failed to initialize Groq client: {e}")
+    logger.info("✅ Sarvam AI STT ready.")
 
-init_groq_stt()
+init_sarvam_stt()
 
 # --- Piper TTS Initialization ---
 # Piper is a fast local ONNX-based TTS engine (~80-200ms synthesis)
@@ -217,6 +213,20 @@ threading.Thread(target=init_faiss_rag, daemon=True).start()
 
 # In-memory session store: call_sid → message list
 sessions: Dict[str, List[Dict[str, str]]] = {}
+campaigns: Dict[str, dict] = {}
+campaign_lock = threading.Lock()
+TERMINAL_CALL_STATUSES = {"completed", "busy", "no-answer", "canceled", "failed", "hangup"}
+CALL_POLL_INTERVAL_SECONDS = 2
+CALL_MAX_DURATION_SECONDS = int(os.getenv("CALL_MAX_DURATION_SECONDS", "180"))
+CSV_PHONE_HEADERS = {"phone", "phone_number", "mobile", "number", "contact"}
+LANG_PATTERN = re.compile(r"LANG:\s*([a-z\-]+)", re.IGNORECASE)
+TEXT_PATTERN = re.compile(r"TEXT:\s*(.*?)(?=\s*\||\s*NAME:|\s*INTEREST:|\s*STATUS:|$)", re.DOTALL | re.IGNORECASE)
+METADATA_PATTERNS = {
+    "user_name": re.compile(r"NAME:\s*(.*?)(?=\s*\||STATUS:|INTEREST:|LANG:|TEXT:|$)", re.IGNORECASE | re.DOTALL),
+    "interest": re.compile(r"INTEREST:\s*(.*?)(?=\s*\||STATUS:|NAME:|LANG:|TEXT:|$)", re.IGNORECASE | re.DOTALL),
+    "lead_status": re.compile(r"STATUS:\s*(.*?)(?=\s*\||NAME:|INTEREST:|LANG:|TEXT:|$)", re.IGNORECASE | re.DOTALL),
+    "follow_up": re.compile(r"FOLLOW_UP:\s*(.*?)(?=\s*\||$)", re.IGNORECASE | re.DOTALL),
+}
 
 # ─────────────────────────────────────────
 # HELPERS
@@ -340,7 +350,7 @@ def call_ollama_chat(messages: List[Dict[str, str]], temperature: float = 0.7, m
             "num_predict": max_tokens,
         },
     }
-    response = requests.post(
+    response = http_session.post(
         f"{OLLAMA_BASE_URL}/api/chat",
         json=payload,
         timeout=OLLAMA_TIMEOUT_SECONDS,
@@ -388,8 +398,8 @@ def get_ai_response(call_sid: str, user_input: str) -> Dict[str, str]:
 
         ai_data = {"lang": "en-IN", "text": raw_text}
 
-        lang_match = re.search(r"LANG:\s*([a-z\-]+)", raw_text, re.IGNORECASE)
-        text_match = re.search(r"TEXT:\s*(.*?)(?=\s*\||\s*NAME:|\s*INTEREST:|\s*STATUS:|$)", raw_text, re.DOTALL | re.IGNORECASE)
+        lang_match = LANG_PATTERN.search(raw_text)
+        text_match = TEXT_PATTERN.search(raw_text)
 
         if lang_match:
             ai_data["lang"] = lang_match.group(1).strip()
@@ -400,14 +410,8 @@ def get_ai_response(call_sid: str, user_input: str) -> Dict[str, str]:
             ai_data["text"] = cleaned.strip().strip('|').strip()
 
         metadata = {}
-        patterns = [
-            ("user_name",   r"NAME:\s*(.*?)(?=\s*\||STATUS:|INTEREST:|LANG:|TEXT:|$)"),
-            ("interest",    r"INTEREST:\s*(.*?)(?=\s*\||STATUS:|NAME:|LANG:|TEXT:|$)"),
-            ("lead_status", r"STATUS:\s*(.*?)(?=\s*\||NAME:|INTEREST:|LANG:|TEXT:|$)"),
-            ("follow_up",   r"FOLLOW_UP:\s*(.*?)(?=\s*\||$)"),
-        ]
-        for key, pattern in patterns:
-            m = re.search(pattern, raw_text, re.IGNORECASE | re.DOTALL)
+        for key, pattern in METADATA_PATTERNS.items():
+            m = pattern.search(raw_text)
             if m:
                 val = m.group(1).strip().strip('|').strip()
                 if val.lower() != "unknown" and val:
@@ -477,6 +481,260 @@ def get_ngrok_headers():
     """Return headers required to bypass ngrok browser warning."""
     return {"ngrok-skip-browser-warning": "true"}
 
+
+def normalize_phone_number(raw_phone: str) -> str:
+    candidate = (raw_phone or "").strip().replace(" ", "")
+    if candidate.startswith("+"):
+        return "+" + re.sub(r"\D", "", candidate[1:])
+    return re.sub(r"\D", "", candidate)
+
+
+def get_call_status_from_db(call_sid: str) -> Optional[str]:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT status FROM calls WHERE call_sid = ?", (call_sid,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def extract_phone_numbers_from_file_bytes(file_bytes: bytes, filename: str) -> List[str]:
+    seen = set()
+    numbers: List[str] = []
+
+    if filename.lower().endswith((".xlsx", ".xls")) or file_bytes.startswith(b"PK\x03\x04"):
+        try:
+            from openpyxl import load_workbook
+            from io import BytesIO
+            wb = load_workbook(BytesIO(file_bytes), data_only=True)
+            sheet = wb.active
+            rows = list(sheet.iter_rows(values_only=True))
+            if not rows: return []
+            
+            headers = [re.sub(r"\s+", "_", str(cell).strip().lower()) for cell in rows[0] if cell]
+            phone_col_index = next((idx for idx, name in enumerate(headers) if name in CSV_PHONE_HEADERS), -1)
+            start_index = 1 if phone_col_index >= 0 else 0
+            
+            for row in rows[start_index:]:
+                if phone_col_index >= 0 and len(row) > phone_col_index:
+                    candidate = str(row[phone_col_index] or "")
+                else:
+                    candidate = str(row[0] or "") if row else ""
+                phone = normalize_phone_number(candidate)
+                if not phone or len(phone.replace("+", "")) < 8 or phone in seen:
+                    continue
+                seen.add(phone)
+                numbers.append(phone)
+            return numbers
+        except Exception as e:
+            logger.error(f"Excel parsing failed: {e}")
+            # Fall through to CSV parsing if Excel fails
+            pass
+
+    try:
+        decoded = file_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            decoded = file_bytes.decode("utf-16")
+        except UnicodeDecodeError:
+            decoded = file_bytes.decode("latin-1", errors="ignore")
+
+    try:
+        reader = csv.reader(StringIO(decoded, newline=''))
+        rows = [row for row in reader if any((cell or "").strip() for cell in row)]
+    except csv.Error:
+        # Fallback for malformed CSVs with unquoted stray newlines
+        reader = csv.reader(decoded.splitlines())
+        rows = [row for row in reader if any((cell or "").strip() for cell in row)]
+    if not rows:
+        return []
+
+    normalized_headers = [re.sub(r"\s+", "_", (cell or "").strip().lower()) for cell in rows[0]]
+    phone_col_index = next((idx for idx, name in enumerate(normalized_headers) if name in CSV_PHONE_HEADERS), -1)
+    start_index = 1 if phone_col_index >= 0 else 0
+
+    for row in rows[start_index:]:
+        if phone_col_index >= 0:
+            candidate = row[phone_col_index] if len(row) > phone_col_index else ""
+        else:
+            candidate = row[0] if row else ""
+        phone = normalize_phone_number(candidate)
+        if not phone or len(phone.replace("+", "")) < 8 or phone in seen:
+            continue
+        seen.add(phone)
+        numbers.append(phone)
+
+    return numbers
+
+
+def _start_campaign(phone_numbers: List[str], dynamic_base_url: str) -> dict:
+    campaign_id = uuid.uuid4().hex
+    campaign_data = {
+        "campaign_id": campaign_id,
+        "status": "pending",
+        "phone_numbers": phone_numbers,
+        "total": len(phone_numbers),
+        "completed_count": 0,
+        "current_index": None,
+        "current_phone": None,
+        "current_call_sid": None,
+        "current_call_status": None,
+        "stop_requested": False,
+        "results": [],
+        "created_at": datetime.now().isoformat(),
+        "started_at": None,
+        "ended_at": None,
+    }
+
+    with campaign_lock:
+        campaigns[campaign_id] = campaign_data
+
+    threading.Thread(
+        target=_run_campaign,
+        args=(campaign_id, phone_numbers, dynamic_base_url),
+        daemon=True,
+    ).start()
+    return campaign_data
+
+
+def initiate_outbound_call(phone_number: str, dynamic_base_url: str) -> dict:
+    url = f"https://api.vobiz.ai/api/v1/Account/{VOBIZ_AUTH_ID}/Call/"
+    headers = {
+        "X-Auth-ID": VOBIZ_AUTH_ID,
+        "X-Auth-Token": VOBIZ_AUTH_TOKEN,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "from": VOBIZ_FROM_NUMBER,
+        "to": phone_number,
+        "answer_url": f"{dynamic_base_url}/vobiz-answer",
+        "answer_method": "POST",
+        "hangup_url": f"{dynamic_base_url}/status",
+        "hangup_method": "POST"
+    }
+    logger.info(f"📤 Initiating call to {phone_number} | answer_url={payload['answer_url']}")
+    response = http_session.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT_SECONDS)
+    result = response.json()
+    if not response.ok:
+        raise HTTPException(status_code=response.status_code, detail=result.get("message", "Vobiz API error"))
+    call_uuid = result.get("request_uuid") or f"unknown_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    save_call_log(call_uuid, {"phone_number": phone_number, "status": "queued"})
+    return {"call_sid": call_uuid, "details": result}
+
+
+def _run_campaign(campaign_id: str, phone_numbers: List[str], dynamic_base_url: str):
+    with campaign_lock:
+        campaign = campaigns.get(campaign_id)
+        if not campaign:
+            return
+        campaign["status"] = "running"
+        campaign["started_at"] = datetime.now().isoformat()
+
+    for index, phone in enumerate(phone_numbers):
+        with campaign_lock:
+            campaign = campaigns.get(campaign_id)
+            if not campaign:
+                return
+            if campaign.get("stop_requested"):
+                campaign["status"] = "stopped"
+                campaign["current_index"] = None
+                campaign["current_phone"] = None
+                campaign["current_call_sid"] = None
+                campaign["current_call_status"] = None
+                campaign["ended_at"] = datetime.now().isoformat()
+                return
+            campaign["current_index"] = index
+            campaign["current_phone"] = phone
+            campaign["current_call_status"] = "initiated"
+
+        try:
+            result = initiate_outbound_call(phone, dynamic_base_url)
+            call_sid = result["call_sid"]
+            with campaign_lock:
+                campaign = campaigns.get(campaign_id)
+                if not campaign:
+                    return
+                campaign["current_call_sid"] = call_sid
+                campaign["results"].append({
+                    "phone_number": phone,
+                    "call_sid": call_sid,
+                    "status": "initiated",
+                })
+
+            started = time.time()
+            while True:
+                with campaign_lock:
+                    campaign = campaigns.get(campaign_id)
+                    if not campaign:
+                        return
+                    if campaign.get("stop_requested"):
+                        campaign["status"] = "stopped"
+                        campaign["current_index"] = None
+                        campaign["current_phone"] = None
+                        campaign["current_call_sid"] = None
+                        campaign["current_call_status"] = None
+                        campaign["ended_at"] = datetime.now().isoformat()
+                        return
+
+                latest_status = (get_call_status_from_db(call_sid) or "").lower()
+                with campaign_lock:
+                    campaign = campaigns.get(campaign_id)
+                    if not campaign:
+                        return
+                    campaign["current_call_status"] = latest_status or "initiated"
+                if latest_status in TERMINAL_CALL_STATUSES:
+                    with campaign_lock:
+                        campaign = campaigns.get(campaign_id)
+                        if not campaign:
+                            return
+                        campaign["results"][-1]["status"] = latest_status
+                    break
+
+                if time.time() - started > CALL_MAX_DURATION_SECONDS:
+                    timeout_status = "failed"
+                    save_call_log(call_sid, {"status": timeout_status, "end_reason": "campaign_timeout"})
+                    with campaign_lock:
+                        campaign = campaigns.get(campaign_id)
+                        if not campaign:
+                            return
+                        campaign["results"][-1]["status"] = timeout_status
+                        campaign["results"][-1]["end_reason"] = "campaign_timeout"
+                    break
+
+                time.sleep(CALL_POLL_INTERVAL_SECONDS)
+
+        except Exception as e:
+            logger.error(f"Campaign call failed for {phone}: {e}")
+            with campaign_lock:
+                campaign = campaigns.get(campaign_id)
+                if not campaign:
+                    return
+                campaign["results"].append({
+                    "phone_number": phone,
+                    "status": "failed",
+                    "error": str(e),
+                })
+        finally:
+            with campaign_lock:
+                campaign = campaigns.get(campaign_id)
+                if not campaign:
+                    return
+                campaign["completed_count"] = len(campaign["results"])
+                campaign["current_call_sid"] = None
+                campaign["current_call_status"] = None
+
+    with campaign_lock:
+        campaign = campaigns.get(campaign_id)
+        if not campaign:
+            return
+        if campaign.get("status") != "stopped":
+            campaign["status"] = "completed"
+        campaign["current_index"] = None
+        campaign["current_phone"] = None
+        campaign["current_call_sid"] = None
+        campaign["current_call_status"] = None
+        campaign["ended_at"] = datetime.now().isoformat()
+
 def gather_xml(request: Request, speak_text: str, action_path: str, lang: str = "en-IN") -> str:
     """
     Returns a valid Vobiz <Record> block with <Play> nested inside for local Whisper/TTS.
@@ -491,7 +749,7 @@ def gather_xml(request: Request, speak_text: str, action_path: str, lang: str = 
     <Record action="{base_url}/{action_path}" 
             method="POST" 
             maxLength="15" 
-            timeout="3" 
+            timeout="2" 
             playBeep="false" />
     <Redirect method="POST">{base_url}/vobiz-silent</Redirect>
 </Response>"""
@@ -565,7 +823,7 @@ async def vobiz_respond(request: Request):
         or ""
     ).strip()
 
-    if recording_url and groq_client:
+    if recording_url and SARVAM_API_KEY:
         # Download the audio file (Vobiz media API requires auth headers)
         try:
             import time as _time
@@ -574,7 +832,7 @@ async def vobiz_respond(request: Request):
                 "X-Auth-ID": VOBIZ_AUTH_ID,
                 "X-Auth-Token": VOBIZ_AUTH_TOKEN,
             }
-            audio_response = requests.get(recording_url, headers=dl_headers, timeout=10)
+            audio_response = http_session.get(recording_url, headers=dl_headers, timeout=HTTP_TIMEOUT_SECONDS)
             audio_data = audio_response.content
             logger.info(f"   Downloaded {len(audio_data)} bytes (status={audio_response.status_code})")
             
@@ -582,31 +840,49 @@ async def vobiz_respond(request: Request):
                 logger.error(f"   Recording download failed or too small — status={audio_response.status_code}, body={audio_data[:200]}")
                 user_speech = ""
             else:
-                # Save to temp file for Groq API
+                # Save to temp file for Sarvam AI API
                 ext = ".mp3" if recording_url.lower().endswith(".mp3") else ".wav"
                 temp_filename = f"temp_{uuid.uuid4().hex}{ext}"
                 with open(temp_filename, "wb") as f:
                     f.write(audio_data)
+
+                try:
+                    # Run Sarvam AI STT
+                    _stt_start = _time.time()
+                    logger.info("   Running Sarvam AI STT (saaras:v3)...")
+                    url = "https://api.sarvam.ai/speech-to-text"
+                    payload = {'model': 'saaras:v3'}
+                    headers = {'api-subscription-key': SARVAM_API_KEY}
                     
-                # Run Groq Whisper STT (Large-v3 Turbo on Groq LPU)
-                _stt_start = _time.time()
-                logger.info("   Running Groq Whisper STT (large-v3-turbo)...")
-                with open(temp_filename, "rb") as audio_file:
-                    transcription = groq_client.audio.transcriptions.create(
-                        file=(temp_filename, audio_file.read()),
-                        model="whisper-large-v3-turbo",
-                    )
-                user_speech = transcription.text.strip()
-                _stt_elapsed = (_time.time() - _stt_start) * 1000
-                logger.info(f"   Groq STT result ({_stt_elapsed:.0f}ms): '{user_speech}'")
-                
-                # Cleanup temp file
-                os.remove(temp_filename)
+                    with open(temp_filename, "rb") as audio_file:
+                        files = [('file', (temp_filename, audio_file, 'audio/wav'))]
+                        response = requests.post(url, headers=headers, data=payload, files=files)
+                        
+                    if response.status_code == 200:
+                        response_data = response.json()
+                        detected_lang = response_data.get("language_code", "")
+                        
+                        # Restrict to English, Hindi, Gujarati
+                        allowed_langs = ["en-IN", "hi-IN", "gu-IN"]
+                        
+                        if detected_lang and detected_lang not in allowed_langs:
+                            logger.warning(f"   [!] Sarvam STT detected unsupported language '{detected_lang}'. Ignoring input.")
+                            user_speech = ""
+                        else:
+                            user_speech = response_data.get("transcript", "").strip()
+                            _stt_elapsed = (_time.time() - _stt_start) * 1000
+                            logger.info(f"   Sarvam STT result ({_stt_elapsed:.0f}ms) [Lang: {detected_lang}]: '{user_speech}'")
+                    else:
+                        logger.error(f"   Sarvam STT API failed: {response.status_code} {response.text}")
+                        user_speech = ""
+                finally:
+                    if os.path.exists(temp_filename):
+                        os.remove(temp_filename)
         except Exception as e:
-            logger.error(f"Failed to process audio with Groq STT: {e}")
+            logger.error(f"Failed to process audio with Sarvam STT: {e}")
             user_speech = ""
-    elif recording_url and not groq_client:
-        logger.warning("Groq STT client not initialized! Check GROQ_API_KEY.")
+    elif recording_url and not SARVAM_API_KEY:
+        logger.warning("Sarvam STT client not initialized! Check SARVAM_API_KEY.")
         user_speech = ""
 
     call_sid = (
@@ -722,6 +998,10 @@ class LoginRequest(BaseModel):
 class CallRequest(BaseModel):
     phone_number: str
 
+
+class CampaignRequest(BaseModel):
+    phone_numbers: List[str]
+
 class Course(BaseModel):
     name: str
     description: str
@@ -745,41 +1025,110 @@ async def trigger_call(req: CallRequest, request: Request):
     # Derive the public base URL dynamically from the incoming request so
     # Vobiz callback URLs always point to the correct live server (Render, ngrok, etc.)
     dynamic_base_url = get_base_url(request)
-    url = f"https://api.vobiz.ai/api/v1/Account/{VOBIZ_AUTH_ID}/Call/"
-    headers = {
-        "X-Auth-ID": VOBIZ_AUTH_ID,
-        "X-Auth-Token": VOBIZ_AUTH_TOKEN,
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "from": VOBIZ_FROM_NUMBER,
-        "to": req.phone_number,
-        "answer_url": f"{dynamic_base_url}/vobiz-answer",
-        "answer_method": "POST",
-        "hangup_url": f"{dynamic_base_url}/status",
-        "hangup_method": "POST"
-    }
-    logger.info(f"📤 Initiating call to {req.phone_number} | answer_url={payload['answer_url']}")
+    clean_phone = normalize_phone_number(req.phone_number)
+    if not clean_phone:
+        raise HTTPException(status_code=400, detail="Invalid phone number")
     try:
-        response = requests.post(url, headers=headers, json=payload)
-        result = response.json()
-        if not response.ok:
-            raise HTTPException(status_code=response.status_code, detail=result.get("message", "Vobiz API error"))
-        call_uuid = result.get("request_uuid") or f"unknown_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-        save_call_log(call_uuid, {"phone_number": req.phone_number})
-        return {"success": True, "call_sid": call_uuid, "status": "queued", "details": result}
+        result = initiate_outbound_call(clean_phone, dynamic_base_url)
+        return {"success": True, "call_sid": result["call_sid"], "status": "queued", "details": result["details"]}
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Call failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.post("/api/call/campaign")
+async def start_call_campaign(req: CampaignRequest, request: Request):
+    cleaned_numbers: List[str] = []
+    seen = set()
+    for raw in req.phone_numbers:
+        phone = normalize_phone_number(raw)
+        if not phone or phone in seen:
+            continue
+        seen.add(phone)
+        cleaned_numbers.append(phone)
+
+    if not cleaned_numbers:
+        raise HTTPException(status_code=400, detail="No valid phone numbers found")
+
+    dynamic_base_url = get_base_url(request)
+    campaign_data = _start_campaign(cleaned_numbers, dynamic_base_url)
+
+    return {
+        "success": True,
+        "campaign_id": campaign_data["campaign_id"],
+        "status": "pending",
+        "total": len(cleaned_numbers),
+    }
+
+
+@app.post("/api/call/campaign/upload")
+async def start_call_campaign_from_csv(request: Request, file: UploadFile = File(...)):
+    filename = file.filename or "uploaded.csv"
+    if not filename.lower().endswith((".csv", ".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="Only .csv and .xlsx files are supported")
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    numbers = extract_phone_numbers_from_file_bytes(content, filename)
+    if not numbers:
+        raise HTTPException(status_code=400, detail="No valid phone numbers found in CSV")
+
+    dynamic_base_url = get_base_url(request)
+    campaign_data = _start_campaign(numbers, dynamic_base_url)
+    return {
+        "success": True,
+        "campaign_id": campaign_data["campaign_id"],
+        "status": campaign_data["status"],
+        "total": campaign_data["total"],
+        "filename": filename,
+    }
+
+
+@app.get("/api/call/campaign/{campaign_id}")
+async def get_call_campaign_status(campaign_id: str):
+    with campaign_lock:
+        campaign = campaigns.get(campaign_id)
+        if not campaign:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+
+        safe_results = campaign["results"][-20:]
+        return {
+            "campaign_id": campaign["campaign_id"],
+            "status": campaign["status"],
+            "total": campaign["total"],
+            "completed_count": campaign["completed_count"],
+            "current_index": campaign["current_index"],
+            "current_phone": campaign["current_phone"],
+            "current_call_sid": campaign["current_call_sid"],
+            "current_call_status": campaign["current_call_status"],
+            "results": safe_results,
+            "created_at": campaign["created_at"],
+            "started_at": campaign["started_at"],
+            "ended_at": campaign["ended_at"],
+        }
+
+
+@app.post("/api/call/campaign/{campaign_id}/stop")
+async def stop_call_campaign(campaign_id: str):
+    with campaign_lock:
+        campaign = campaigns.get(campaign_id)
+        if not campaign:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        if campaign["status"] in {"completed", "stopped"}:
+            return {"success": True, "campaign_id": campaign_id, "status": campaign["status"]}
+        campaign["stop_requested"] = True
+    return {"success": True, "campaign_id": campaign_id, "status": "stopping"}
+
 @app.post("/api/end_call/{call_sid}")
 async def end_call(call_sid: str):
     try:
         url = f"https://api.vobiz.ai/api/v1/Account/{VOBIZ_AUTH_ID}/Call/{call_sid}/"
         headers = {"X-Auth-ID": VOBIZ_AUTH_ID, "X-Auth-Token": VOBIZ_AUTH_TOKEN}
-        requests.delete(url, headers=headers)
+        http_session.delete(url, headers=headers, timeout=HTTP_TIMEOUT_SECONDS)
         save_call_log(call_sid, {"status": "completed", "end_reason": "user_initiated"})
         return {"success": True, "status": "completed"}
     except Exception as e:
@@ -844,7 +1193,7 @@ async def llm_health_check():
 
     if AI_PROVIDER == "ollama":
         try:
-            tags = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=10)
+            tags = http_session.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=HTTP_TIMEOUT_SECONDS)
             tags.raise_for_status()
             models = [m.get("name") for m in tags.json().get("models", [])]
             return {

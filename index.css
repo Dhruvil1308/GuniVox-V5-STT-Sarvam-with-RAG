@@ -12,6 +12,16 @@
   }
 }
 
+@keyframes waveform {
+  0% { height: 10px; opacity: 0.2; }
+  50% { height: var(--peak-height); opacity: 1; }
+  100% { height: 10px; opacity: 0.2; }
+}
+
+.animate-waveform {
+  animation: waveform var(--duration) ease-in-out var(--delay) infinite;
+}
+
 body {
   background-color: #0f172a; /* Slate 900 fallback */
   color: #f8fafc;

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useMemo, useState, useEffect } from 'react';
 import axios from 'axios';
 import {
   Phone,
@@ -18,6 +18,8 @@ import {
   BookOpen,
   Edit2,
   Trash2,
+  FileUp,
+  Square,
   Plus,
   Search,
   Calendar,
@@ -27,6 +29,10 @@ import { motion, AnimatePresence } from 'framer-motion';
 
 // --- CONFIGURATION ---
 const API_URL = "";
+const api = axios.create({
+  baseURL: API_URL || undefined,
+  timeout: 15000,
+});
 
 // --- TYPES ---
 interface CallLog {
@@ -47,6 +53,25 @@ interface Stats {
   recent_calls: CallLog[];
 }
 
+interface CampaignResult {
+  phone_number: string;
+  call_sid?: string;
+  status: string;
+  error?: string;
+}
+
+interface CampaignProgress {
+  campaign_id: string;
+  status: "pending" | "running" | "completed" | "stopped" | "failed";
+  total: number;
+  completed_count: number;
+  current_index: number | null;
+  current_phone: string | null;
+  current_call_sid: string | null;
+   current_call_status: string | null;
+  results: CampaignResult[];
+}
+
 const App: React.FC = () => {
   // --- STATE ---
   const [isLoggedIn, setIsLoggedIn] = useState(false);
@@ -61,6 +86,11 @@ const App: React.FC = () => {
   const [callStatus, setCallStatus] = useState<"idle" | "calling" | "connected" | "ended">("idle");
   const [currentSid, setCurrentSid] = useState("");
   const [transcript, setTranscript] = useState<any[]>([]);
+  const [csvFileName, setCsvFileName] = useState("");
+  const [csvFile, setCsvFile] = useState<File | null>(null);
+  const [campaignId, setCampaignId] = useState<string | null>(null);
+  const [campaignProgress, setCampaignProgress] = useState<CampaignProgress | null>(null);
+  const [isCampaignStarting, setIsCampaignStarting] = useState(false);
 
   // Analytics State
   const [stats, setStats] = useState<Stats | null>(null);
@@ -83,11 +113,15 @@ const App: React.FC = () => {
 
   const [currentCourse, setCurrentCourse] = useState<Course>({ name: '', description: '', fees: '' });
   const [isEditingCourse, setIsEditingCourse] = useState(false);
-  const [courseSearch, setCourseSearch] = useState("");
-
-  const filteredCourses = courses.filter(c =>
-    c.name.toLowerCase().includes(courseSearch.toLowerCase()) ||
-    c.description.toLowerCase().includes(courseSearch.toLowerCase())
+  const visualizerBars = useMemo(
+    () =>
+      Array.from({ length: 16 }, (_, i) => ({
+        id: i,
+        peakHeight: Math.random() * 150 + 50,
+        duration: 0.8 / (Math.random() * 0.5 + 0.5),
+        delay: i * 0.05,
+      })),
+    [],
   );
 
   // --- HANDLERS ---
@@ -97,7 +131,7 @@ const App: React.FC = () => {
     setIsLoading(true);
     setError("");
     try {
-      const res = await axios.post(`${API_URL}/api/login`, { username, password });
+      const res = await api.post(`/api/login`, { username, password });
       if (res.data.token) {
         setIsLoggedIn(true);
       }
@@ -109,10 +143,10 @@ const App: React.FC = () => {
   };
 
   const handleCall = async () => {
-    if (!phoneNumber) return;
+    if (!phoneNumber || isCampaignActive) return;
     setCallStatus("calling");
     try {
-      const res = await axios.post(`${API_URL}/api/call`, { phone_number: phoneNumber });
+      const res = await api.post(`/api/call`, { phone_number: phoneNumber });
       if (res.data.success) {
         setCallStatus("connected");
         setCurrentSid(res.data.call_sid);
@@ -124,10 +158,63 @@ const App: React.FC = () => {
     }
   };
 
+  const handleCsvUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith(".csv")) {
+      alert("Please upload a valid .csv file.");
+      event.target.value = "";
+      return;
+    }
+    setCsvFileName(file.name);
+    setCsvFile(file);
+    event.target.value = "";
+  };
+
+  const handleStartCampaign = async () => {
+    if (!csvFile || isCampaignStarting || campaignId) return;
+    setIsCampaignStarting(true);
+    try {
+      const formData = new FormData();
+      formData.append("file", csvFile);
+      const res = await api.post(`/api/call/campaign/upload`, formData, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+      setCampaignId(res.data.campaign_id);
+      setCampaignProgress({
+        campaign_id: res.data.campaign_id,
+        status: "pending",
+        total: res.data.total,
+        completed_count: 0,
+        current_index: null,
+        current_phone: null,
+        current_call_sid: null,
+        current_call_status: null,
+        results: [],
+      });
+      setCallStatus("idle");
+      setCurrentSid("");
+      setTranscript([]);
+    } catch (err) {
+      alert("Failed to start CSV call campaign.");
+    } finally {
+      setIsCampaignStarting(false);
+    }
+  };
+
+  const handleStopCampaign = async () => {
+    if (!campaignId) return;
+    try {
+      await api.post(`/api/call/campaign/${campaignId}/stop`);
+    } catch (err) {
+      alert("Failed to stop campaign.");
+    }
+  };
+
   const handleEndCall = async () => {
     if (!currentSid) return;
     try {
-      await axios.post(`${API_URL}/api/end_call/${currentSid}`);
+      await api.post(`/api/end_call/${currentSid}`);
       setCallStatus("ended");
     } catch (err) {
       console.error("Failed to end call", err);
@@ -138,7 +225,7 @@ const App: React.FC = () => {
 
   const fetchLogs = async () => {
     try {
-      const res = await axios.get(`${API_URL}/api/calls`, {
+      const res = await api.get(`/api/calls`, {
         params: {
           q: searchQuery,
           start_date: startDate,
@@ -154,7 +241,7 @@ const App: React.FC = () => {
 
   const fetchStats = async () => {
     try {
-      const res = await axios.get(`${API_URL}/api/stats`, {
+      const res = await api.get(`/api/stats`, {
         params: { start_date: startDate, end_date: endDate }
       });
       setStats(res.data);
@@ -167,7 +254,7 @@ const App: React.FC = () => {
     e.stopPropagation();
     if (!window.confirm("Are you sure you want to delete this log?")) return;
     try {
-      await axios.delete(`${API_URL}/api/calls/${id}`);
+      await api.delete(`/api/calls/${id}`);
       fetchLogs(); // Refresh
       fetchStats(); // Update stats counters
     } catch (err) {
@@ -177,7 +264,7 @@ const App: React.FC = () => {
 
   const fetchCourses = async () => {
     try {
-      const res = await axios.get(`${API_URL}/api/courses`);
+      const res = await api.get(`/api/courses`);
       setCourses(res.data);
     } catch (err) {
       console.error("Failed to fetch courses");
@@ -188,9 +275,9 @@ const App: React.FC = () => {
     e.preventDefault();
     try {
       if (isEditingCourse && currentCourse.id) {
-        await axios.put(`${API_URL}/api/courses/${currentCourse.id}`, currentCourse);
+        await api.put(`/api/courses/${currentCourse.id}`, currentCourse);
       } else {
-        await axios.post(`${API_URL}/api/courses`, currentCourse);
+        await api.post(`/api/courses`, currentCourse);
       }
       setIsCourseModalOpen(false);
       resetCourseForm();
@@ -203,7 +290,7 @@ const App: React.FC = () => {
   const handleDeleteCourse = async (id: number) => {
     if (!window.confirm("Delete this course?")) return;
     try {
-      await axios.delete(`${API_URL}/api/courses/${id}`);
+      await api.delete(`/api/courses/${id}`);
       fetchCourses();
     } catch (err) {
       alert("Failed to delete course.");
@@ -230,7 +317,7 @@ const App: React.FC = () => {
   };
 
   useEffect(() => {
-    let interval: any;
+    let interval: ReturnType<typeof setInterval> | undefined;
     if (activeView === 'analytics') {
       fetchStats();
       fetchLogs();
@@ -243,11 +330,11 @@ const App: React.FC = () => {
 
   // Poll for Active Call Status & Transcript
   useEffect(() => {
-    let interval: any;
+    let interval: ReturnType<typeof setInterval> | undefined;
     if (callStatus === 'connected' && currentSid) {
       interval = setInterval(async () => {
         try {
-          const res = await axios.get(`${API_URL}/api/call/${currentSid}`);
+          const res = await api.get(`/api/call/${currentSid}`);
           const { status, transcript } = res.data;
 
           if (transcript && transcript.length > 0) {
@@ -265,6 +352,35 @@ const App: React.FC = () => {
     }
     return () => clearInterval(interval);
   }, [callStatus, currentSid]);
+
+  useEffect(() => {
+    if (!campaignId) return;
+    let interval: ReturnType<typeof setInterval> | undefined;
+
+    const pollCampaign = async () => {
+      try {
+        const res = await api.get(`/api/call/campaign/${campaignId}`);
+        const data: CampaignProgress = res.data;
+        setCampaignProgress(data);
+        if (data.status === "completed" || data.status === "stopped" || data.status === "failed") {
+          setCampaignId(null);
+          fetchStats();
+          fetchLogs();
+        }
+      } catch (err) {
+        console.error("Error polling campaign status", err);
+        // Do not reset campaignId on a single error to handle proxy/network blips gracefully
+      }
+    };
+
+    pollCampaign();
+    interval = setInterval(pollCampaign, 3000);
+    return () => clearInterval(interval);
+  }, [campaignId]);
+
+  const isCampaignActive = Boolean(
+    campaignId && campaignProgress && (campaignProgress.status === "pending" || campaignProgress.status === "running"),
+  );
 
   // --- UI COMPONENTS ---
 
@@ -447,7 +563,7 @@ const App: React.FC = () => {
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -20 }}
                 transition={{ duration: 0.3 }}
-                className="grid lg:grid-cols-2 gap-8 h-[calc(100vh-200px)] min-h-[500px]"
+                className="grid lg:grid-cols-2 gap-8 min-h-[calc(100vh-200px)] items-stretch"
               >
                 {/* DIALER CARD */}
                 <div className="bg-slate-900/50 backdrop-blur-xl rounded-[2rem] border border-white/10 p-10 flex flex-col justify-center items-center text-center relative overflow-hidden group">
@@ -484,9 +600,9 @@ const App: React.FC = () => {
                     />
                   </div>
 
-                  <button
-                    onClick={() => {
-                      if (callStatus === 'connected') {
+                    <button
+                      onClick={() => {
+                        if (callStatus === 'connected') {
                         handleEndCall();
                       } else if (callStatus === 'ended') {
                         setCallStatus('idle');
@@ -496,20 +612,72 @@ const App: React.FC = () => {
                         handleCall();
                       }
                     }}
-                    disabled={callStatus === 'calling'}
+                    disabled={callStatus === 'calling' || isCampaignActive}
                     className={`w-full max-w-sm py-5 rounded-2xl font-bold text-lg shadow-xl hover:shadow-2xl transition-all transform hover:-translate-y-1 active:scale-95 flex items-center justify-center gap-3 
                         ${callStatus === 'connected'
                         ? 'bg-red-500/90 hover:bg-red-600 text-white shadow-red-900/20'
                         : callStatus === 'ended'
                           ? 'bg-slate-700 hover:bg-slate-600 text-white'
                           : 'bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white shadow-blue-900/20'
-                      }`}
-                  >
+                        }`}
+                    >
                     {callStatus === 'idle' && <><PhoneCall size={22} /> Initiate Call</>}
                     {callStatus === 'calling' && <><span className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></span> Connecting...</>}
                     {callStatus === 'connected' && <><Phone size={22} className="rotate-[135deg]" /> End Secure Call</>}
                     {callStatus === 'ended' && <><Zap size={22} /> Start New Call</>}
-                  </button>
+                    </button>
+
+                    <div className="w-full max-w-sm mt-6 pt-6 border-t border-slate-700/50 text-left">
+                      <label className="block text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">
+                        CSV Auto Dial Campaign
+                      </label>
+                      <label className="w-full cursor-pointer flex items-center justify-center gap-2 py-3 px-4 rounded-xl border border-slate-600 bg-slate-900/40 text-slate-200 hover:bg-slate-800/60 transition-colors">
+                        <FileUp size={16} />
+                        Upload CSV
+                        <input type="file" accept=".csv" className="hidden" onChange={handleCsvUpload} />
+                      </label>
+                      <p className="text-xs text-slate-400 mt-2">
+                        {csvFileName ? `${csvFileName} selected` : "Upload a CSV with phone numbers in first column or 'phone' header."}
+                      </p>
+
+                      {campaignProgress && (
+                        <div className="mt-4 p-3 rounded-xl bg-slate-950/70 border border-slate-700">
+                          <p className="text-xs text-slate-300 font-bold uppercase tracking-wider">
+                            Campaign: {campaignProgress.status}
+                          </p>
+                          <p className="text-sm text-slate-200 mt-1">
+                            {campaignProgress.completed_count}/{campaignProgress.total} completed
+                          </p>
+                          {campaignProgress.current_phone && (
+                            <p className="text-xs text-blue-300 mt-1">
+                              Calling: {campaignProgress.current_phone}
+                            </p>
+                          )}
+                          {campaignProgress.current_call_status && (
+                            <p className="text-xs text-slate-400 mt-1">
+                              Current call status: {campaignProgress.current_call_status}
+                            </p>
+                          )}
+                        </div>
+                      )}
+
+                      <div className="mt-4 flex gap-3">
+                        <button
+                          onClick={handleStartCampaign}
+                          disabled={!csvFile || isCampaignStarting || isCampaignActive}
+                          className="flex-1 py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                        >
+                          {isCampaignStarting ? "Starting..." : "Start CSV Calls"}
+                        </button>
+                        <button
+                          onClick={handleStopCampaign}
+                          disabled={!isCampaignActive}
+                          className="flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                        >
+                          <Square size={14} /> Stop
+                        </button>
+                      </div>
+                    </div>
 
                   {callStatus === 'connected' && (
                     <p className="mt-6 text-sm text-slate-400 animate-pulse font-medium flex items-center gap-2">
@@ -532,22 +700,17 @@ const App: React.FC = () => {
                   <div className="flex-1 flex items-center justify-center gap-2 min-h-[250px] relative">
                     <div className="absolute inset-0 bg-gradient-to-t from-slate-950 to-transparent z-10 pointer-events-none" />
 
-                    {[...Array(16)].map((_, i) => (
-                      <motion.div
-                        key={i}
-                        className="w-3 rounded-full bg-gradient-to-t from-blue-600 to-cyan-400 shadow-[0_0_15px_rgba(34,211,238,0.3)]"
-                        animate={{
-                          height: callStatus === 'connected'
-                            ? [20, Math.random() * 150 + 50, 20]
-                            : 10,
-                          opacity: callStatus === 'connected' ? 1 : 0.2
-                        }}
-                        transition={{
-                          repeat: Infinity,
-                          duration: 0.8 / (Math.random() * 0.5 + 0.5),
-                          ease: "easeInOut",
-                          delay: i * 0.05
-                        }}
+                    {visualizerBars.map((bar) => (
+                      <div
+                        key={bar.id}
+                        className={`w-3 rounded-full bg-gradient-to-t from-blue-600 to-cyan-400 shadow-[0_0_15px_rgba(34,211,238,0.3)] ${callStatus === 'connected' ? 'animate-waveform' : ''}`}
+                        style={{
+                          height: '10px',
+                          opacity: callStatus === 'connected' ? 1 : 0.2,
+                          '--peak-height': `${bar.peakHeight}px`,
+                          '--duration': `${bar.duration}s`,
+                          '--delay': `${bar.delay}s`,
+                        } as React.CSSProperties}
                       />
                     ))}
                   </div>
@@ -988,10 +1151,10 @@ const App: React.FC = () => {
                 <button
                   onClick={async () => {
                     try {
-                      await axios.post(`${API_URL}/api/calls/${selectedLog.id}/reanalyze`);
+                      await api.post(`/api/calls/${selectedLog.id}/reanalyze`);
                       fetchLogs();
                       // Re-fetch the updated log to refresh the modal
-                      const res = await axios.get(`${API_URL}/api/calls`, { params: { q: selectedLog.phone_number } });
+                      const res = await api.get(`/api/calls`, { params: { q: selectedLog.phone_number } });
                       const updated = res.data.find((c: any) => c.id === selectedLog.id);
                       if (updated) setSelectedLog(updated);
                     } catch (err) {

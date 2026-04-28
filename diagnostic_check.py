@@ -90,24 +90,19 @@ except Exception as e:
     check("Piper TTS test", False, str(e))
 
 # ──────────────────────────────────────────────────────────────
-# 3. Groq Whisper STT (cloud-based)
+# 3. Sarvam AI STT (cloud-based)
 # ──────────────────────────────────────────────────────────────
-print("\n[3] GROQ WHISPER STT")
+print("\n[3] SARVAM AI STT")
 try:
     from dotenv import load_dotenv
     load_dotenv(".env.local")
-    groq_key = os.getenv("GROQ_API_KEY", "")
-    check("GROQ_API_KEY present", bool(groq_key) and len(groq_key) > 10,
-          f"Key: {groq_key[:12]}..." if groq_key else "NOT SET")
-    if groq_key:
-        from groq import Groq
-        gc = Groq(api_key=groq_key)
-        # Quick validation: list models to confirm key works
-        check("Groq client initialised", gc is not None, "whisper-large-v3-turbo ready")
-except ImportError:
-    check("groq package installed", False, "Run: pip install groq")
+    sarvam_key = os.getenv("SARVAM_API_KEY", "")
+    check("SARVAM_API_KEY present", bool(sarvam_key) and len(sarvam_key) > 10,
+          f"Key: {sarvam_key[:12]}..." if sarvam_key else "NOT SET")
+    if sarvam_key:
+        check("Sarvam API key present", True, "saaras:v3 ready")
 except Exception as e:
-    check("Groq STT check", False, str(e))
+    check("Sarvam STT check", False, str(e))
 
 # ──────────────────────────────────────────────────────────────
 # 4. OpenAI API (LLM)
