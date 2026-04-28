@@ -49,25 +49,17 @@ sequenceDiagram
     User->>Twilio: Speaks for 2s chunk
     Twilio->>Backend: Streams Audio
     
-    rect rgb(200, 220, 250)
-        Backend->>STT: Send Audio
-        STT-->>Backend: Transcript (~400ms)
-    end
+    Backend->>STT: Send Audio
+    STT-->>Backend: Transcript (~400ms)
     
-    rect rgb(220, 250, 220)
-        Backend->>RAG: Embed & Search
-        RAG-->>Backend: Context (~50ms)
-    end
+    Backend->>RAG: Embed & Search
+    RAG-->>Backend: Context (~50ms)
     
-    rect rgb(250, 220, 220)
-        Backend->>LLM: Prompt + Context
-        LLM-->>Backend: Response (~800ms)
-    end
+    Backend->>LLM: Prompt + Context
+    LLM-->>Backend: Response (~800ms)
     
-    rect rgb(250, 250, 220)
-        Backend->>TTS: Generate Audio
-        TTS-->>Backend: WAV Stream (~150ms)
-    end
+    Backend->>TTS: Generate Audio
+    TTS-->>Backend: WAV Stream (~150ms)
     
     Backend->>Twilio: Stream Back
     Twilio->>User: Audio Playback (Turnaround ~1.4s)
