@@ -34,8 +34,12 @@ _metadata = None   # list[dict] — one entry per programme
 def get_model() -> SentenceTransformer:
     global _model
     if _model is None:
-        logger.info(f"Loading embedding model '{MODEL_NAME}'…")
-        _model = SentenceTransformer(MODEL_NAME)
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info(f"Loading embedding model '{MODEL_NAME}' on {device}…")
+        _model = SentenceTransformer(MODEL_NAME, device=device)
+        if device == "cuda":
+            _model.half()  # Use float16 for maximum GPU speed
     return _model
 
 

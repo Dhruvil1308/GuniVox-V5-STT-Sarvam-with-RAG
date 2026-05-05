@@ -14,8 +14,8 @@ You are GuniVox, the intelligent voice assistant for Ganpat University (GUNI) ad
 Location: Ganpat Vidyanagar, Mehsana–Gandhinagar Highway, Gujarat, India.
 
 STRICT OPERATIONAL GUIDELINES:
-1. INITIAL GREETING: "Hello! Welcome to Ganpat University Admissions. I am GuniVox. How can I assist you with your course inquiry today?"
-2. MULTILINGUAL: Detect and respond in the user's language (English, Hindi, or Gujarati). If they switch, you switch immediately.
+1. INITIAL GREETING: "નમસ્તે! ગણપત યુનિવર્સિટી એડમિશનમાં તમારું સ્વાગત છે. હું ગૂનીવોક્સ છું. હું તમારી કેવી રીતે મદદ કરી શકું?"
+2. MULTILINGUAL: Your default language is Gujarati. Detect and respond in the user's language (Gujarati, Hindi, or English).
 3. CONCISION: Keep spoken answers under 20 words.
 4. KNOWLEDGE: Use the provided data for GUNI courses, fees, and eligibility.
 5. ESCALATION: If the user asks for a human or specific help, provide the admissions hotline: +91-81006-16161.
@@ -115,8 +115,8 @@ const VoiceAgent: React.FC = () => {
 
     try {
       // Setup Audio Contexts
-      const ctxIn = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-      const ctxOut = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      const ctxIn = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const ctxOut = new (window.AudioContext || (window as any).webkitAudioContext)();
       
       if (ctxIn.state === 'suspended') await ctxIn.resume();
       if (ctxOut.state === 'suspended') await ctxOut.resume();
@@ -130,13 +130,13 @@ const VoiceAgent: React.FC = () => {
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       
       const session = await ai.live.connect({
-        model: 'gemini-2.5-flash-native-audio-preview-12-2025',
+        model: 'gemini-2.0-flash-live-001',
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
           },
-          systemInstruction: SYSTEM_INSTRUCTION,
+          systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
           inputAudioTranscription: {},
           outputAudioTranscription: {},
         },
@@ -163,9 +163,10 @@ const VoiceAgent: React.FC = () => {
               const base64Data = encodeBase64(new Uint8Array(int16.buffer));
               
               try {
+                const sampleRate = audioContextInRef.current!.sampleRate;
                 // Ensure session is actually ready before pushing bits
                 sessionRef.current.sendRealtimeInput({ 
-                  media: { data: base64Data, mimeType: 'audio/pcm;rate=16000' } 
+                  media: { data: base64Data, mimeType: \`audio/pcm;rate=\${sampleRate}\` } 
                 });
               } catch (err) {
                 console.debug("Dropped audio frame during socket fluctuation.");

@@ -9,10 +9,9 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![FAISS](https://img.shields.io/badge/Vector_DB-FAISS-00599C?style=for-the-badge&logo=faiss&logoColor=white)](https://github.com/facebookresearch/faiss)
 [![Sarvam AI](https://img.shields.io/badge/STT-Sarvam_AI-FF9900?style=for-the-badge&logo=ai&logoColor=white)](https://sarvam.ai)
-[![Piper TTS](https://img.shields.io/badge/TTS-Piper_ONNX-000000?style=for-the-badge&logo=onnx&logoColor=white)](https://github.com/rhasspy/piper)
 [![OpenAI](https://img.shields.io/badge/OpenAI-GPT--4o--mini-412991?style=for-the-badge&logo=openai&logoColor=white)](https://openai.com)
 
-**GuniVox V5** is the most advanced, performance-optimized version of the outbound voice assistant for **Ganpat University**. It features a robust **FAISS RAG** system and is heavily optimized for ultra-low latency interactions using **Sarvam AI STT** and **Piper TTS**.
+**GuniVox V5** is the most advanced, performance-optimized version of the outbound voice assistant for **Ganpat University**. It features a robust **FAISS RAG** system and is heavily optimized for ultra-low latency interactions using **Sarvam AI STT** and **TTS**.
 
 ---
 
@@ -34,7 +33,7 @@ GuniVox V5 was explicitly architected to achieve near-human conversation latency
 | **Language Detection** | **Sarvam AI Auto-Detect** | Automatically detects whether the user speaks **English, Hindi, or Gujarati** and drops unsupported languages at the API level. | *(Included in STT)* |
 | **Semantic RAG Search** | **FAISS + SentenceTransformers** | Uses local vector embeddings (`all-MiniLM-L6-v2`) to perform instantaneous similarity searches across `final_dataset.json`. Injects factual university data into the LLM context. | `< 50 ms` |
 | **AI Logic (LLM)** | **OpenAI (`gpt-4o-mini`)** | The "brain" of GuniVox. Processes the STT transcript + RAG context and formulates a concise, conversational response. | `~600 - 900 ms` |
-| **Text-to-Speech (TTS)** | **Piper TTS (ONNX)** | Generates ultra-low latency voice audio locally using ONNX graphs (e.g., `en_US-lessac-medium.onnx`). Bypasses network delays and heavy transformer layers used by legacy models. | `~100 - 150 ms` |
+| **Text-to-Speech (TTS)** | **TTS** | Generates ultra-low latency voice audio. | `~100 - 150 ms` |
 | **Telephony** | **Vobiz & Twilio** | Manages SIP routing and outbound calls to users. | `~100 ms (Network)` |
 
 ### 📉 Latency Breakdown (Visual)
@@ -46,7 +45,7 @@ sequenceDiagram
     participant STT as Sarvam AI
     participant RAG as FAISS
     participant LLM as GPT-4o-mini
-    participant TTS as Piper TTS
+    participant TTS
 
     User->>Twilio: Speaks for 2s chunk
     Twilio->>Backend: Streams Audio
@@ -79,7 +78,7 @@ sequenceDiagram
 | **🤖 AI Voice Agent** | Human-like AI counselor with warm, friendly tone |
 | **📞 Outbound Dialer** | One-click outbound calls via Twilio/Vobiz API from the React dashboard |
 | **🗣️ Multilingual** | Strict Auto-detection — **English (en-IN), Gujarati (gu-IN), Hindi (hi-IN)** |
-| **⚡ Ultra-Low Latency** | Powered by Sarvam AI STT + Piper TTS |
+| **⚡ Ultra-Low Latency** | Powered by Sarvam AI STT + TTS |
 | **📊 Live Analytics** | Real-time call stats, positive lead tracking, and searchable call history |
 | **📝 Live Transcription** | Real-time Speech-to-Text transcription displayed during active calls |
 | **🎓 Course Management** | Full CRUD interface for managing university courses and fees |
@@ -99,8 +98,8 @@ sequenceDiagram
         ┌──────────────┬───────────────┼───────────────┬──────────────┐
         │              │               │               │              │
    ┌────▼────┐   ┌─────▼─────┐   ┌─────▼─────┐   ┌─────▼─────┐  ┌─────▼─────┐
-   │ Vobiz / │   │ Sarvam AI │   │  OpenAI   │   │ FAISS     │  │ Piper TTS │
-   │ Twilio  │   │ saaras:v3 │   │  GPT-4o-m │   │ Vector DB │  │ (ONNX)    │
+   │ Vobiz / │   │ Sarvam AI │   │  OpenAI   │   │ FAISS     │  │ TTS       │
+   │ Twilio  │   │ saaras:v3 │   │  GPT-4o-m │   │ Vector DB │  │           │
    └─────────┘   └───────────┘   └───────────┘   └───────────┘  └───────────┘
 ```
 
@@ -126,11 +125,7 @@ pip install -r requirements.txt
 npm install
 ```
 
-### 4. Build the FAISS Index
-```bash
-python build_faiss_index.py
-```
-*This processes `final_dataset.json` and creates the local `faiss_index`.*
+
 
 ### 5. Environment Variables (`.env.local`)
 Create a `.env.local` file in the root directory:
@@ -172,9 +167,8 @@ npm run dev
 
 ```
 GuniVox_V3/
-├── server.py               # FastAPI backend — Webhooks, LLM logic, Sarvam STT, Piper TTS
+├── server.py               # FastAPI backend — Webhooks, LLM logic, Sarvam STT, TTS
 ├── faiss_rag.py            # FAISS vector database integration logic
-├── build_faiss_index.py    # Script to build vector embeddings from JSON
 ├── prompt_config.py        # System prompt and conversational behavior logic
 ├── diagnostic_check.py     # Script to verify API keys and environment health
 ├── App.tsx                 # Main React Frontend App

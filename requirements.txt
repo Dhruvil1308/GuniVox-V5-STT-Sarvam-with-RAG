@@ -7,8 +7,7 @@ python-dotenv
 openpyxl
 pydantic
 python-multipart
-gtts
-piper-tts
 numpy
 faiss-cpu
 sentence-transformers
+tavily-python

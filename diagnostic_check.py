@@ -3,14 +3,13 @@
 diagnostic_check.py
 Full end-to-end health check for GuniVox:
   1. Server reachability & LLM config
-  2. Piper TTS
-  3. Groq Whisper STT (cloud)
-  4. OpenAI GPT-4o-mini (LLM)
-  5. Vobiz API connectivity
-  6. Webhook endpoint reachability
-  7. TTS audio file generation + HTTP serving
-  8. FAISS RAG index & search
-  9. Public URL / tunnel check
+  2. Groq Whisper STT (cloud)
+  3. OpenAI GPT-4o-mini (LLM)
+  4. Vobiz API connectivity
+  5. Webhook endpoint reachability
+  6. TTS audio file generation + HTTP serving
+  7. FAISS RAG index & search
+  8. Public URL / tunnel check
 """
 
 import os, sys, time, wave, tempfile, uuid, requests, json
@@ -52,42 +51,7 @@ try:
 except Exception as e:
     check("Server is running", False, str(e))
 
-# ──────────────────────────────────────────────────────────────
-# 2. Piper TTS -- generate audio via /vobiz-answer simulation
-# ──────────────────────────────────────────────────────────────
-print("\n[2] PIPER TTS")
-try:
-    from piper.voice import PiperVoice
-    voices_dir = os.path.join(os.path.dirname(__file__), "piper_voices")
-    onnx_files = [f for f in os.listdir(voices_dir) if f.endswith(".onnx")]
-    check("piper-tts installed", True)
-    check("Voice model file exists", len(onnx_files) > 0,
-          f"Found: {onnx_files}")
-    if onnx_files:
-        model_path = os.path.join(voices_dir, onnx_files[0])
-        config_path = model_path + ".json"
-        voice = PiperVoice.load(
-            model_path,
-            config_path=config_path if os.path.exists(config_path) else None,
-            use_cuda=False
-        )
-        tmp = os.path.join(tempfile.gettempdir(), f"piper_test_{uuid.uuid4().hex}.wav")
-        t0 = time.time()
-        with wave.open(tmp, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(22050)
-            voice.synthesize("Hello, this is a Piper TTS test.", wf)
-        ms = int((time.time() - t0) * 1000)
-        size = os.path.getsize(tmp)
-        os.remove(tmp)
-        check("Piper synthesis works", size > 1000,
-              f"Generated {size} bytes in {ms}ms")
-        check(f"Latency < 500ms", ms < 500, f"Actual: {ms}ms")
-except ImportError:
-    check("piper-tts installed", False, "Run: pip install piper-tts")
-except Exception as e:
-    check("Piper TTS test", False, str(e))
+
 
 # ──────────────────────────────────────────────────────────────
 # 3. Sarvam AI STT (cloud-based)
@@ -232,9 +196,9 @@ except Exception as e:
     check("FAISS RAG check", False, str(e))
 
 # ──────────────────────────────────────────────────────────────
-# 9. Public URL / tunnel check
+# 8. Public URL / tunnel check
 # ──────────────────────────────────────────────────────────────
-print("\n[9] PUBLIC URL")
+print("\n[8] PUBLIC URL")
 try:
     # Read BASE_URL from the running server's env
     base_url = os.getenv("BASE_URL", "")
