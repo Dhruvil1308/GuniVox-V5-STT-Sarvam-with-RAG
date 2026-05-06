@@ -11,13 +11,9 @@ REM --- 1. Python FastAPI Backend (via uvicorn) ---
 echo [1/3] Launching Python Backend (uvicorn)...
 start "GuniVox Backend" cmd /k "cd /d %~dp0 && call .venv\Scripts\activate && uvicorn server:app --host 0.0.0.0 --port 8000 --reload"
 
-REM --- 2. Ngrok Tunnel ---
-echo [2/3] Launching Ngrok Tunnel (port 8000)...
-if exist "D:\ngrok.exe" (
-    start "Ngrok Tunnel" cmd /k "D:\ngrok.exe http 8000"
-) else (
-    start "Ngrok Tunnel" cmd /k "ngrok http 8000"
-)
+REM --- 2. Cloudflare Tunnel ---
+echo [2/3] Launching Cloudflare Tunnel (gunivox)...
+start "Cloudflare Tunnel" cmd /k "cloudflared tunnel run gunivox"
 
 REM --- 3. React Frontend (Vite dev server) ---
 echo [3/3] Launching React Frontend (Vite)...

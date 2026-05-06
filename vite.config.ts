@@ -8,6 +8,9 @@ export default defineConfig(({ mode }) => {
       server: {
         port: 3000,
         host: '0.0.0.0',
+        watch: {
+          ignored: ['**/.venv/**', '**/node_modules/**', '**/gunivox.db', '**/logs/**'],
+        },
         // Proxy API calls to the Python backend during local dev
         proxy: {
           '/api': 'http://localhost:8000',

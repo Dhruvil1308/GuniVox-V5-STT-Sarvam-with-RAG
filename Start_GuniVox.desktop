@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Name=Start GuniVox V3
+Comment=Start Backend, Frontend, and Cloudflare Tunnel for GuniVox
+Exec=/bin/bash "/home/dhruvil/GuniVox V3/GuniVox V3/start_multi.sh"
+Icon=utilities-terminal
+Terminal=false
+Type=Application
+Categories=Development;

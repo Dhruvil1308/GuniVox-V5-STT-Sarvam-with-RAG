@@ -10,13 +10,13 @@ source .venv/bin/activate
 uvicorn server:app --host 0.0.0.0 --port 8000 --reload &
 BACKEND_PID=$!
 
-# 2. Start ngrok if available (optional)
-echo "[2/3] Checking for ngrok..."
-if command -v ngrok &> /dev/null; then
-    echo "Launching Ngrok Tunnel (port 8000)..."
-    ngrok http 8000 &
+# 2. Start cloudflared tunnel
+echo "[2/3] Checking for cloudflared..."
+if command -v cloudflared &> /dev/null; then
+    echo "Launching Cloudflare Tunnel (gunivox)..."
+    cloudflared tunnel run gunivox &
 else
-    echo "ngrok not found. Skipping ngrok tunnel."
+    echo "cloudflared not found. Skipping tunnel."
 fi
 
 # 3. Start React Frontend
