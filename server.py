@@ -167,22 +167,7 @@ def _build_system_prompt() -> str:
         c.execute("SELECT name, description, fees FROM courses")
         rows = c.fetchall(); conn.close()
         course_text = "\n".join([f"- **{r[0]}:** {r[2]}. {r[1]}" for r in rows]) or "- No specific course data available."
-        return SYSTEM_PROMPT + course_text + """
-
-### CRITICAL OUTPUT FORMAT — FOLLOW THIS EXACTLY IN EVERY SINGLE RESPONSE:
-LANG: [code] | TEXT: [spoken text] | NAME: [name or Unknown] | INTEREST: [course or Unknown] | STATUS: [Positive/Negative/Pending]
-
-EXAMPLES:
-User: "Yes I can talk."
-Output: LANG: en-IN | TEXT: That's lovely! May I know your good name? | NAME: Unknown | INTEREST: Unknown | STATUS: Pending
-
-User: "My name is Manoj"
-Output: LANG: en-IN | TEXT: Just to be sure, did you say your name is Manoj? | NAME: Manoj | INTEREST: Unknown | STATUS: Pending
-
-User: "I'm interested in BCA"
-Output: LANG: en-IN | TEXT: Great choice! BCA is 70,000 per year. Want to know more? | NAME: Manoj | INTEREST: BCA | STATUS: Positive
-
-REMEMBER: NAME, INTEREST, STATUS must appear in EVERY response. Never drop these tags."""
+        return SYSTEM_PROMPT + "\n\n### ADDITIONAL COURSE DATA:\n" + course_text
     except Exception as e:
         logger.error(f"Prompt build error: {e}")
         return SYSTEM_PROMPT
@@ -291,7 +276,9 @@ def build_rag_context(query: str) -> str:
     if not ENABLE_RAG or not faiss_rag.is_ready():
         return ""
     try:
+        logger.info(f"🔍 RAG query: {query}")
         results = faiss_rag.search(query, top_k=RAG_TOP_K)
+        logger.info(f"🔍 RAG results found: {len(results)}")
         if not results:
             return ""
         parts = []
@@ -343,23 +330,29 @@ async def _transcribe_sarvam(audio_bytes: bytes, filename: str) -> str:
     """Sarvam saaras:v3 via BytesIO — no disk write (⚡ OPT-2 applied to fallback too)."""
     def _sync():
         _t = time.time()
-        try:
-            url     = "https://api.sarvam.ai/speech-to-text"
-            payload = {'model': 'saaras:v3'}
-            headers = {'api-subscription-key': SARVAM_API_KEY}
-            audio_io = BytesIO(audio_bytes)
-            resp = requests.post(url, headers=headers, data=payload,
-                                 files=[('file', (filename, audio_io, 'audio/wav'))],
-                                 timeout=HTTP_TIMEOUT_SECONDS)
-            if resp.status_code == 200:
-                transcript = resp.json().get("transcript", "").strip()
-                logger.info(f"🎙️ Sarvam STT ({(time.time()-_t)*1000:.0f}ms): '{transcript}'")
-                return transcript
-            logger.error(f"Sarvam STT {resp.status_code}: {resp.text[:200]}")
-            return ""
-        except Exception as e:
-            logger.error(f"Sarvam STT error: {e}")
-            return ""
+        for attempt in range(2):
+            try:
+                url     = "https://api.sarvam.ai/speech-to-text"
+                payload = {'model': 'saaras:v3'}
+                headers = {'api-subscription-key': SARVAM_API_KEY}
+                audio_io = BytesIO(audio_bytes)
+                resp = requests.post(url, headers=headers, data=payload,
+                                     files=[('file', (filename, audio_io, 'audio/wav'))],
+                                     timeout=HTTP_TIMEOUT_SECONDS)
+                if resp.status_code == 200:
+                    transcript = resp.json().get("transcript", "").strip()
+                    logger.info(f"🎙️ Sarvam STT ({(time.time()-_t)*1000:.0f}ms): '{transcript}'")
+                    return transcript
+                if resp.status_code == 429 and attempt == 0:
+                    logger.warning("Sarvam STT 429 Rate Limit. Sleeping 1.5s...")
+                    time.sleep(1.5)
+                    continue
+                logger.error(f"Sarvam STT {resp.status_code}: {resp.text[:200]}")
+                return ""
+            except Exception as e:
+                logger.error(f"Sarvam STT error: {e}")
+                return ""
+        return ""
     return await asyncio.get_running_loop().run_in_executor(_executor, _sync)
 
 # ─────────────────────────────────────────
@@ -438,9 +431,6 @@ def _get_httpx_client() -> httpx.AsyncClient:
 
 SARVAM_LANG_MAP = {
     "en-IN": "en-IN", "hi-IN": "hi-IN", "gu-IN": "gu-IN",
-    "mr-IN": "mr-IN", "ta-IN": "ta-IN", "te-IN": "te-IN",
-    "kn-IN": "kn-IN", "ml-IN": "ml-IN", "bn-IN": "bn-IN",
-    "pa-IN": "pa-IN", "or-IN": "or-IN",
 }
 
 async def generate_tts_audio(text: str, BASE_URL: str, lang: str = "gu-IN") -> str:
@@ -513,7 +503,7 @@ async def _gtts_fallback(text: str, lang: str, BASE_URL: str) -> str:
             logger.error(f"gTTS failed: {e}")
             return ""
     filename = await asyncio.get_running_loop().run_in_executor(_executor, _gtts_synth)
-    return f"{base_url}/static/audio/{filename}" if filename else ""
+    return f"{BASE_URL}/static/audio/{filename}" if filename else ""
 
 # ─────────────────────────────────────────
 # ⚡ OPT-8: Pre-warm TTS for common phrases at startup
@@ -524,6 +514,10 @@ PREWARM_PHRASES = [
     ("એવું લાગે છે કે તમે અત્યારે ઉપલબ્ધ નથી. અમે તમને પછીથી કોલ કરીશું. આવજો!", "gu-IN"),
     ("તમારી પૂછપરછ માટે આભાર. શું હું બીજી કોઈ મદદ કરી શકું?", "gu-IN"),
     ("ગણપત યુનિવર્સિટીમાં તમારો રસ લેવા બદલ આભાર.", "gu-IN"),
+    ("माफ़ करना, मुझे ठीक से समझ नहीं आया। क्या आप फिर से कह सकते हैं?", "hi-IN"),
+    ("क्या आप अभी भी वहां हैं? कृपया कुछ बोलें।", "hi-IN"),
+    ("Sorry, I didn't quite understand. Could you please repeat that?", "en-IN"),
+    ("Are you still there? Please say something.", "en-IN"),
 ]
 
 async def _prewarm_tts():
@@ -531,7 +525,7 @@ async def _prewarm_tts():
     await asyncio.sleep(5)  # wait for FAISS and other init to settle
     for text, lang in PREWARM_PHRASES:
         try:
-            await generate_tts_audio(text, BASE_URL, lang)
+            await generate_tts_audio(text, BASE_URL, lang) 
             logger.info(f"🔥 Pre-warmed TTS: '{text[:40]}'")
         except Exception as e:
             logger.warning(f"TTS pre-warm failed for '{text[:30]}': {e}")
@@ -582,7 +576,28 @@ async def get_ai_response(call_sid: str, user_input: str) -> Dict[str, str]:
         text_match = TEXT_PATTERN.search(raw_text)
 
         if lang_match:
-            ai_data["lang"] = lang_match.group(1).strip()
+            detected_lang = lang_match.group(1).strip()
+            if detected_lang in ["gu-IN", "hi-IN", "en-IN"]:
+                ai_data["lang"] = detected_lang
+            else:
+                # fallback to previous language or gu-IN
+                ai_data["lang"] = "gu-IN"
+                for msg in reversed(sessions[call_sid][:-1]):
+                    if msg["role"] == "assistant":
+                        prev_lang_match = LANG_PATTERN.search(msg["content"])
+                        if prev_lang_match and prev_lang_match.group(1).strip() in ["gu-IN", "hi-IN", "en-IN"]:
+                            ai_data["lang"] = prev_lang_match.group(1).strip()
+                            break
+        else:
+            # fallback to previous language
+            ai_data["lang"] = "gu-IN"
+            for msg in reversed(sessions[call_sid][:-1]):
+                if msg["role"] == "assistant":
+                    prev_lang_match = LANG_PATTERN.search(msg["content"])
+                    if prev_lang_match and prev_lang_match.group(1).strip() in ["gu-IN", "hi-IN", "en-IN"]:
+                        ai_data["lang"] = prev_lang_match.group(1).strip()
+                        break
+        
         if text_match:
             ai_data["text"] = text_match.group(1).strip()
         else:
@@ -749,8 +764,22 @@ async def vobiz_respond(request: Request):
                             logger.info(f"   WAV max amplitude: {max_amp}")
                             if max_amp < 2000:  # raised a bit to filter strong static
                                 is_silent = True
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Fallback for G.711 A-law / U-law where wave module fails 
+                    # due to unsupported compression type or missing header constraint.
+                    if len(audio_bytes) > 200:
+                        import statistics
+                        # Sample 2000 bytes from the middle to avoid any headers
+                        mid = len(audio_bytes) // 2
+                        sample_bytes = audio_bytes[mid:mid+2000] if len(audio_bytes) > 4000 else audio_bytes[44:]
+                        variance = statistics.variance(sample_bytes)
+                        max_val_range = max(sample_bytes) - min(sample_bytes) if sample_bytes else 0
+                        logger.info(f"   WAV extraction failed ({e}). Fallback byte variance: {variance:.1f}, Range: {max_val_range}")
+                        
+                        # Pure A-law / U-law silence has near 0 variance. 
+                        # Light static stays under ~500. Human voice pushes variance > 3000.
+                        if variance < 800:
+                            is_silent = True
 
             if is_silent:
                 logger.info("   Background noise detected (silent), skipping STT API to avoid hallucination.")

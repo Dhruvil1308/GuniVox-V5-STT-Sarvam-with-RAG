@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
-MODEL_NAME   = 'all-MiniLM-L6-v2'
+MODEL_NAME   = 'paraphrase-multilingual-MiniLM-L12-v2'
 INDEX_DIR    = 'faiss_index'
 INDEX_FILE   = os.path.join(INDEX_DIR, 'index.faiss')
 METADATA_FILE = os.path.join(INDEX_DIR, 'metadata.json')
@@ -178,10 +178,49 @@ def load_index(force_rebuild: bool = False, json_path: str = 'final_dataset.json
     logger.info(f"✅ FAISS index ready: {_index.ntotal} vectors | {len(_metadata)} records")
 
 
+
+
+ACRONYM_MAP = {
+    "બીસીએ": "BCA", "बीसीए": "BCA", "bca": "BCA",
+    "એમસીએ": "MCA", "एमसीए": "MCA", "mca": "MCA",
+    "બીએસસી": "BSc", "बीएससी": "BSc", "bsc": "BSc",
+    "એમએસસી": "MSc", "एमएससी": "MSc", "msc": "MSc",
+    "બીટેક": "B.Tech", "बीटेक": "B.Tech", "btech": "B.Tech",
+    "એમટેક": "M.Tech", "एमटेक": "M.Tech", "mtech": "M.Tech",
+    "બીબીએ": "BBA", "बीबीए": "BBA", "bba": "BBA",
+    "એમબીએ": "MBA", "एमबीए": "MBA", "mba": "MBA",
+    "ફાર્મસી": "Pharmacy", "फार्मेसी": "Pharmacy", "pharmacy": "Pharmacy",
+    "ડિઝાઇન": "Design", "डिज़ाइन": "Design", "design": "Design",
+    "સાયન્સ": "Science", "विज्ञान": "Science", "science": "Science",
+    "કોમર્સ": "Commerce", "कॉमर्स": "Commerce", "commerce": "Commerce",
+    "એન્જિનિયરિંગ": "Engineering", "इंजीनियरिंग": "Engineering", "engineering": "Engineering",
+    "ડેટા સાયન્સ": "Data Science", "डेटा साइंस": "Data Science",
+    "સાયબર": "Cyber", "साइबर": "Cyber"
+}
+
+def _clean_multilingual_query(q: str) -> str:
+    res = q.lower()
+    for k, v in ACRONYM_MAP.items():
+        res = res.replace(k, v)
+    for k, v in ACRONYM_MAP.items():
+        # check original cases incase keys had upper (they don't, but still)
+        pass 
+    
+    # Simple substitution
+    res = q
+    for k, v in ACRONYM_MAP.items():
+        # case insensitive replacement
+        import re
+        ins_regex = re.compile(re.escape(k), re.IGNORECASE)
+        res = ins_regex.sub(v, res)
+    return res
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Search
+
 # ─────────────────────────────────────────────────────────────────────────────
 def search(query: str, top_k: int = 3, score_threshold: float = SCORE_THRESHOLD) -> list[dict]:
+    query = _clean_multilingual_query(query)
     """
     Semantic search over the programme index.
 
