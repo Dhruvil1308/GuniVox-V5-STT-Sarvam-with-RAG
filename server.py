@@ -111,6 +111,28 @@ FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "dist")
 if os.path.isdir(os.path.join(FRONTEND_DIR, "assets")):
     app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIR, "assets")), name="frontend_assets")
 
+@app.get("/")
+async def serve_index():
+    index_path = os.path.join(FRONTEND_DIR, "index.html")
+    if os.path.isfile(index_path):
+        return FileResponse(index_path)
+    return JSONResponse({"message": "GuniVox Backend is running. Frontend build not found."}, status_code=200)
+
+@app.get("/{full_path:path}")
+async def catch_all(full_path: str):
+    # If the path looks like a file (has extension), try to serve it or 404
+    if "." in full_path.split("/")[-1]:
+        file_path = os.path.join(FRONTEND_DIR, full_path)
+        if os.path.isfile(file_path):
+            return FileResponse(file_path)
+        return Response(status_code=404)
+    
+    # Otherwise, serve index.html for SPA routing
+    index_path = os.path.join(FRONTEND_DIR, "index.html")
+    if os.path.isfile(index_path):
+        return FileResponse(index_path)
+    return JSONResponse({"message": "Not Found"}, status_code=404)
+
 # ─────────────────────────────────────────
 # DATABASE (unchanged)
 # ─────────────────────────────────────────
