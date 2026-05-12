@@ -144,15 +144,33 @@ def init_db():
     c.execute("""
         CREATE TABLE IF NOT EXISTS calls (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            call_sid TEXT UNIQUE, phone_number TEXT, status TEXT,
-            started_at TEXT, end_reason TEXT, user_name TEXT,
-            interest TEXT, lead_status TEXT, follow_up TEXT, transcript TEXT
+            call_sid TEXT UNIQUE, 
+            phone_number TEXT, 
+            status TEXT,
+            started_at TEXT, 
+            ended_at TEXT,
+            duration_seconds INTEGER DEFAULT 0,
+            billable_minutes REAL DEFAULT 0,
+            end_reason TEXT, 
+            user_name TEXT,
+            interest TEXT, 
+            lead_status TEXT, 
+            follow_up TEXT, 
+            transcript TEXT,
+            stage TEXT DEFAULT 'Cold Call'
         )
     """)
     c.execute("""
         CREATE TABLE IF NOT EXISTS courses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT, description TEXT, fees TEXT, brochure_url TEXT
+            name TEXT, 
+            institute TEXT,
+            duration TEXT,
+            fees TEXT, 
+            eligibility TEXT,
+            counsellor TEXT,
+            phone TEXT,
+            brochure_url TEXT
         )
     """)
     c.execute("""
@@ -162,6 +180,9 @@ def init_db():
             source TEXT, created_at TEXT
         )
     """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_calls_phone ON calls(phone_number)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_calls_stage ON calls(stage)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_calls_sid ON calls(call_sid)")
     conn.commit(); conn.close()
     populate_default_courses()
 
@@ -171,12 +192,11 @@ def populate_default_courses():
     c.execute("SELECT COUNT(*) FROM courses")
     if c.fetchone()[0] == 0:
         defaults = [
-            ("BCA",    "Bachelor of Computer Applications. 10+2 English required.", "70,000/yr",            None),
-            ("MCA",    "Master of Computer Applications. Needs BCA/BE/BSc.",        "1,40,000/yr",          None),
-            ("BSc IT", "Bachelor of Science in IT (Data Science/Cyber Security).",  "75,000 - 85,000/yr",   None),
-            ("MSc IT", "Master of Science in IT.",                                  "75,000 - 1,00,000/yr", None),
+            ("BCA", "S.O. Patel College (SOCET)", "3 Years", "70,000/yr", "10+2 English required", "Dr. Mehta", "98765 43210", None),
+            ("MCA", "U.V. Patel College (UVPCE)", "2 Years", "1,40,000/yr", "Needs BCA/BE/BSc with Maths", "Prof. Shah", "98250 12345", None),
+            ("B.Tech IT", "UVPCE", "4 Years", "1,20,000/yr", "12th PCM 45%", "Counselling Team", "79900 11223", None),
         ]
-        c.executemany("INSERT INTO courses (name, description, fees, brochure_url) VALUES (?,?,?,?)", defaults)
+        c.executemany("INSERT INTO courses (name, institute, duration, fees, eligibility, counsellor, phone, brochure_url) VALUES (?,?,?,?,?,?,?,?)", defaults)
         conn.commit(); print("✅ Default courses populated.")
     conn.close()
 
@@ -265,21 +285,50 @@ def _tts_cache_set(text: str, lang: str, url: str):
 def _save_call_log_sync(call_sid: str, data: dict):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT id FROM calls WHERE call_sid = ?", (call_sid,))
-    exists = c.fetchone()
-    if not exists:
-        c.execute("INSERT INTO calls (call_sid, phone_number, status, started_at) VALUES (?,?,?,?)",
-                  (call_sid, data.get('phone_number'), 'initiated', datetime.now().isoformat()))
+    c.execute("SELECT id, started_at, duration_seconds FROM calls WHERE call_sid = ?", (call_sid,))
+    row = c.fetchone()
+    
+    if not row:
+        # Initial insertion
+        c.execute("""
+            INSERT INTO calls (call_sid, phone_number, status, started_at, stage) 
+            VALUES (?,?,?,?,?)
+        """, (call_sid, data.get('phone_number'), 'initiated', datetime.now().isoformat(), data.get('stage', 'Cold Call')))
     else:
-        allowed = ['status', 'end_reason', 'user_name', 'interest', 'lead_status', 'follow_up', 'transcript']
+        # Update existing
+        allowed = ['status', 'end_reason', 'user_name', 'interest', 'lead_status', 'follow_up', 'transcript', 'stage', 'ended_at']
         fields, values = [], []
+        
+        # Duration calculation if status is completed
+        status = data.get('status', '').lower()
+        if status in TERMINAL_CALL_STATUSES and row[1]:
+            ended_at = datetime.now()
+            data['ended_at'] = ended_at.isoformat()
+            try:
+                start_dt = datetime.fromisoformat(row[1])
+                diff = (ended_at - start_dt).total_seconds()
+                data['duration_seconds'] = int(diff)
+                
+                # Billing rounding: 1-30s -> 0.5, 31-60s -> 1.0 per minute
+                # Logic: ceil to nearest 30 seconds, then convert to minutes
+                billable = (int(diff + 29) // 30) * 0.5
+                data['billable_minutes'] = billable
+                
+                allowed.extend(['duration_seconds', 'billable_minutes'])
+            except Exception as e:
+                logger.error(f"Duration calc error: {e}")
+
         for k, v in data.items():
             if k in allowed:
-                fields.append(f"{k} = ?"); values.append(v)
+                fields.append(f"{k} = ?")
+                values.append(v)
+        
         if fields:
             values.append(call_sid)
             c.execute(f"UPDATE calls SET {', '.join(fields)} WHERE call_sid = ?", values)
-    conn.commit(); conn.close()
+            
+    conn.commit()
+    conn.close()
 
 def save_call_log(call_sid: str, data: dict):
     _executor.submit(_save_call_log_sync, call_sid, data)
@@ -641,6 +690,10 @@ async def get_ai_response(call_sid: str, user_input: str) -> Dict[str, str]:
                 if val.lower() != "unknown" and val:
                     metadata[key] = val
 
+        # ⚡ OPT: Promote to Hot Call if status is Positive
+        if metadata.get("lead_status") == "Positive":
+            metadata["stage"] = "Hot Call"
+
         clean_transcript = [msg for msg in sessions[call_sid] if msg['role'] != 'system']
         metadata["transcript"] = json.dumps(clean_transcript)
         save_call_log(call_sid, metadata)
@@ -730,6 +783,9 @@ async def transfer_xml(request: Request, speak_text: str, call_sid: str, lang: s
     BASE_URL = get_base_url(request)
     conf_room = f"gvx_{call_sid[-12:]}"
     sessions[f"__conf__{call_sid}"] = conf_room
+
+    # ⚡ OPT: Update stage to Warm Call in DB
+    save_call_log(call_sid, {"stage": "Warm Call"})
 
     audio_url = await generate_tts_audio(speak_text, BASE_URL, lang)
 
@@ -1232,7 +1288,14 @@ class CampaignRequest(BaseModel):
     phone_numbers: List[str]
 
 class Course(BaseModel):
-    name: str; description: str; fees: str; brochure_url: Optional[str] = None
+    name: str
+    institute: str
+    duration: str
+    fees: str
+    eligibility: str
+    counsellor: str
+    phone: str
+    brochure_url: Optional[str] = None
 
 class RagDocumentRequest(BaseModel):
     title: Optional[str] = None; content: str; source: Optional[str] = "manual"
@@ -1533,8 +1596,10 @@ async def get_courses():
 @app.post("/api/courses")
 async def add_course(course: Course):
     conn = sqlite3.connect(DB_FILE); c = conn.cursor()
-    c.execute("INSERT INTO courses (name, description, fees, brochure_url) VALUES (?,?,?,?)",
-              (course.name, course.description, course.fees, course.brochure_url))
+    c.execute("""
+        INSERT INTO courses (name, institute, duration, fees, eligibility, counsellor, phone, brochure_url) 
+        VALUES (?,?,?,?,?,?,?,?)
+    """, (course.name, course.institute, course.duration, course.fees, course.eligibility, course.counsellor, course.phone, course.brochure_url))
     conn.commit(); cid = c.lastrowid; conn.close()
     invalidate_prompt_cache()
     return {**course.dict(), "id": cid}
@@ -1543,8 +1608,10 @@ async def add_course(course: Course):
 @app.put("/api/courses/{course_id}")
 async def update_course(course_id: int, course: Course):
     conn = sqlite3.connect(DB_FILE); c = conn.cursor()
-    c.execute("UPDATE courses SET name=?,description=?,fees=?,brochure_url=? WHERE id=?",
-              (course.name, course.description, course.fees, course.brochure_url, course_id))
+    c.execute("""
+        UPDATE courses SET name=?, institute=?, duration=?, fees=?, eligibility=?, counsellor=?, phone=?, brochure_url=? 
+        WHERE id=?
+    """, (course.name, course.institute, course.duration, course.fees, course.eligibility, course.counsellor, course.phone, course.brochure_url, course_id))
     conn.commit(); conn.close()
     invalidate_prompt_cache()
     return {"success": True}
@@ -1557,6 +1624,65 @@ async def delete_course(course_id: int):
     conn.commit(); conn.close()
     invalidate_prompt_cache()
     return {"success": True}
+
+# ─────────────────────────────────────────
+# LEAD FLOW & MINUTES API
+# ─────────────────────────────────────────
+
+@app.get("/api/leads")
+async def get_leads():
+    conn = sqlite3.connect(DB_FILE); c = conn.cursor()
+    # We return the latest entry for each phone number
+    c.execute("""
+        SELECT phone_number, stage, call_sid as last_call_sid, started_at as updated_at, 
+               user_name, interest, lead_status, transcript
+        FROM calls 
+        WHERE id IN (SELECT MAX(id) FROM calls GROUP BY phone_number)
+        ORDER BY started_at DESC
+    """)
+    columns = [d[0] for d in c.description]
+    leads = [dict(zip(columns, row)) for row in c.fetchall()]
+    conn.close()
+    return leads
+
+@app.put("/api/leads/{phone}/stage")
+async def update_lead_stage(phone: str, body: dict):
+    stage = body.get("stage", "Cold Call")
+    conn = sqlite3.connect(DB_FILE); c = conn.cursor()
+    c.execute("UPDATE calls SET stage=? WHERE phone_number=?", (stage, phone))
+    conn.commit(); conn.close()
+    return {"success": True}
+
+@app.get("/api/minutes")
+async def get_minutes_data():
+    conn = sqlite3.connect(DB_FILE); c = conn.cursor()
+    
+    # Per-number breakdown
+    c.execute("""
+        SELECT phone_number, COUNT(*) as calls, SUM(duration_seconds) as total_actual_seconds, 
+               SUM(billable_minutes) as billable_minutes
+        FROM calls 
+        WHERE duration_seconds > 0
+        GROUP BY phone_number
+    """)
+    columns = [d[0] for d in c.description]
+    per_number = [dict(zip(columns, row)) for row in c.fetchall()]
+    
+    # Summary
+    c.execute("SELECT SUM(billable_minutes), COUNT(*) FROM calls WHERE duration_seconds > 0")
+    total_billable, total_calls = c.fetchone()
+    
+    active_calls = len([s for s in sessions.keys() if not s.startswith("__")])
+    
+    conn.close()
+    return {
+        "summary": {
+            "total_billable_minutes": round(total_billable or 0, 1),
+            "total_calls_counted": total_calls or 0,
+            "active_calls": active_calls
+        },
+        "per_number": per_number
+    }
 
 
 @app.delete("/api/calls/{call_id}")
