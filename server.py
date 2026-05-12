@@ -49,7 +49,7 @@ http_session = requests.Session()
 
 load_dotenv(".env.local")
 
-_executor = ThreadPoolExecutor(max_workers=4)
+_executor = ThreadPoolExecutor(max_workers=8)  # ⚡ CAG-OPT: doubled workers
 
 # ─────────────────────────────────────────
 # STT — Sarvam saaras:v3
@@ -188,21 +188,46 @@ def populate_default_courses():
 
 init_db()
 
-# ─────────────────────────────────────────
-# System prompt cache
-# ─────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+# CAG — Cache-Augmented Generation
+# The ENTIRE knowledge base (script + all courses) is baked into the
+# system message ONCE at startup and reused for every turn.
+# This eliminates the per-request FAISS vector search (~30-80 ms saved).
+# ═══════════════════════════════════════════════════════════════════════
 _system_prompt_cache: Optional[str] = None
+CAG_ENABLED = os.getenv("CAG_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 def _build_system_prompt() -> str:
+    """CAG: Build a rich system prompt with ALL course data embedded."""
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("SELECT name, description, fees FROM courses")
-        rows = c.fetchall(); conn.close()
-        course_text = "\n".join([f"- **{r[0]}:** {r[2]}. {r[1]}" for r in rows]) or "- No specific course data available."
-        return SYSTEM_PROMPT + "\n\n### ADDITIONAL COURSE DATA:\n" + course_text
+        c.execute("SELECT name, institute, duration, fees, eligibility, counsellor, phone FROM courses")
+        rows = c.fetchall()
+        conn.close()
+        if rows:
+            course_lines = []
+            for r in rows:
+                name, institute, duration, fees, eligibility, counsellor, phone = r
+                course_lines.append(
+                    f"  • {name} | {institute} | {duration} | {fees} | "
+                    f"Eligibility: {eligibility} | Counsellor: {counsellor} ({phone})"
+                )
+            course_block = "\n".join(course_lines)
+        else:
+            course_block = "  (No courses in database yet)"
+
+        cag_note = (
+            "\n\n### [CAG — CACHED KNOWLEDGE BASE]\n"
+            "The following is the COMPLETE course catalogue. "
+            "Use this as the single source of truth. DO NOT retrieve externally.\n"
+            f"{course_block}"
+        )
+        full_prompt = SYSTEM_PROMPT + cag_note
+        logger.info(f"✅ CAG system prompt built | {len(rows)} courses embedded | {len(full_prompt)} chars")
+        return full_prompt
     except Exception as e:
-        logger.error(f"Prompt build error: {e}")
+        logger.error(f"CAG prompt build error: {e}")
         return SYSTEM_PROMPT
 
 def get_system_prompt_with_courses() -> str:
@@ -248,11 +273,11 @@ METADATA_PATTERNS = {
 }
 
 # ─────────────────────────────────────────
-# ⚡ OPT-5: TTS audio LRU cache
+# ⚡ OPT-5: TTS audio LRU cache — bumped to 200 for CAG
 # Keyed by (text, lang) → static URL. Avoids Sarvam round-trip for repeated phrases.
 # ─────────────────────────────────────────
 _tts_cache: Dict[tuple, str] = {}
-_TTS_CACHE_MAX = 64
+_TTS_CACHE_MAX = 200  # ⚡ CAG-OPT: was 64
 
 def _tts_cache_get(text: str, lang: str) -> Optional[str]:
     return _tts_cache.get((text.strip(), lang))
@@ -572,28 +597,31 @@ async def _gtts_fallback(text: str, lang: str, BASE_URL: str) -> str:
 # ─────────────────────────────────────────
 PREWARM_PHRASES = [
     ("માફ કરશો, મને બરાબર સમજાયું નથી. શું તમે ફરીથી કહી શકશો?", "gu-IN"),
-    ("શું તમે હજી ત્યાં છો? કૃપા કરીને કંઈક બોલો.", "gu-IN"),
-    ("એવું લાગે છે કે તમે અત્યારે ઉપલબ્ધ નથી. અમે તમને પછીથી કોલ કરીશું. આવજો!", "gu-IN"),
-    ("તમારી પૂછપરછ માટે આભાર. શું હું બીજી કોઈ મદદ કરી શકું?", "gu-IN"),
-    ("ગણપત યુનિવર્સિટીમાં તમારો રસ લેવા બદલ આભાર.", "gu-IN"),
-    ("माफ़ करना, मुझे ठीक से समझ नहीं आया। क्या आप फिर से कह सकते हैं?", "hi-IN"),
-    ("क्या आप अभी भी वहां हैं? कृपया कुछ बोलें।", "hi-IN"),
-    ("Sorry, I didn't quite understand. Could you please repeat that?", "en-IN"),
+    ("શું તમે કોલ પર છો?", "gu-IN"),
+    ("કોઈ જવાબ ન મળવાને કારણે અમે કોલ સમાપ્ત કરી રહ્યા છીએ. આવજો!", "gu-IN"),
+    ("તમારો દિવસ શુભ રહે, આવજો.", "gu-IN"),
+    ("સરસ! કૃપા કરીને તમારું latest qualification જણાવશો? 10th, 12th, કે Graduation?", "gu-IN"),
+    ("અને તમને કયા career fieldમાં રસ છે? જેમ કે Engineering, Management, Pharmacy, Design, Commerce, Science અથવા અન્ય Professional Courses.", "gu-IN"),
+    ("Perfect, કૃપા કરીને થોડી ક્ષણ લાઇન પર રહો, હું તમને અમારી counselling team સાથે transfer કરું છું જેથી તેઓ sessionની સંપૂર્ણ માહિતી શેર કરી શકે.", "gu-IN"),
+    ("ગણપત યુનિવર્સિટીના એડમિશનની ઇન્ક્વાયરી માટે સ્ટુડન્ટ તમારી સાથે વાત કરવા માંગે છે, હું કનેક્ટ કરી રહી છું.", "gu-IN"),
     ("Are you still there? Please say something.", "en-IN"),
 ]
 
 async def _prewarm_tts():
-    """Generate TTS for common phrases at boot so first real call doesn't pay the penalty."""
-    await asyncio.sleep(5)  # wait for FAISS and other init to settle
-    for text, lang in PREWARM_PHRASES:
-        try:
-            await generate_tts_audio(text, BASE_URL, lang) 
-            logger.info(f"🔥 Pre-warmed TTS: '{text[:40]}'")
-        except Exception as e:
-            logger.warning(f"TTS pre-warm failed for '{text[:30]}': {e}")
+    """⚡ CAG-OPT: Pre-generate TTS for ALL scripted phrases at boot."""
+    await asyncio.sleep(3)  # wait for DB init to settle
+    base_url = BASE_URL or "http://localhost:8000"
+    tasks = [generate_tts_audio(text, base_url, lang) for text, lang in PREWARM_PHRASES]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    ok = sum(1 for r in results if isinstance(r, str) and r)
+    logger.info(f"🔥 TTS pre-warm complete: {ok}/{len(PREWARM_PHRASES)} phrases cached")
 
 @app.on_event("startup")
 async def startup_event():
+    # Build CAG prompt immediately
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(_executor, get_system_prompt_with_courses)
+    logger.info("✅ CAG system prompt loaded into memory")
     asyncio.create_task(_prewarm_tts())
 
 # ─────────────────────────────────────────
@@ -613,19 +641,21 @@ async def get_ai_response(call_sid: str, user_input: str) -> Dict[str, str]:
     try:
         request_messages = list(sessions[call_sid])
 
-        # RAG in thread pool (runs quickly, ~20-50 ms)
-        rag_context = await asyncio.get_running_loop().run_in_executor(
-            _executor, build_rag_context, user_input
-        )
-        if rag_context:
-            request_messages.insert(1, {
-                "role": "system",
-                "content": (
-                    "Use this retrieved context as highest-priority factual grounding. "
-                    "If context conflicts with older memory, prefer retrieved context.\n\n"
-                    f"RETRIEVED_CONTEXT:\n{rag_context}"
-                ),
-            })
+        # ⚡ CAG: Knowledge base is already in the system prompt.
+        # Only run FAISS if CAG is disabled (fallback) — saves 30-80 ms per turn.
+        if not CAG_ENABLED:
+            rag_context = await asyncio.get_running_loop().run_in_executor(
+                _executor, build_rag_context, user_input
+            )
+            if rag_context:
+                request_messages.insert(1, {
+                    "role": "system",
+                    "content": (
+                        "Use this retrieved context as highest-priority factual grounding. "
+                        "If context conflicts with older memory, prefer retrieved context.\n\n"
+                        f"RETRIEVED_CONTEXT:\n{rag_context}"
+                    ),
+                })
 
         # Stream LLM response
         raw_text = await _collect_llm_response(call_sid, request_messages)
@@ -698,14 +728,12 @@ async def gather_xml(request: Request, speak_text: str, action_path: str, lang: 
     audio_url = await generate_tts_audio(speak_text, BASE_URL, lang)
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Gather input="speech" 
-            action="{BASE_URL}/{action_path}" 
-            method="POST" 
-            speechTimeout="1.0" 
-            language="{lang}"
-            bargeIn="true">
-        <Play>{audio_url}</Play>
-    </Gather>
+    <Play>{audio_url}</Play>
+    <Record action="{BASE_URL}/{action_path}"
+            method="POST"
+            maxLength="15"
+            timeout="{timeout}"
+            playBeep="false" />
     <Redirect method="POST">{BASE_URL}/vobiz-silent</Redirect>
 </Response>"""
 
@@ -952,14 +980,12 @@ async def vobiz_answer(request: Request):
 
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Gather input="speech" 
-            action="{BASE_URL}/vobiz-respond" 
-            method="POST" 
-            speechTimeout="1.0" 
-            language="gu-IN" 
-            bargeIn="true">
-        <Play>{audio_url}</Play>
-    </Gather>
+    <Play>{audio_url}</Play>
+    <Record action="{BASE_URL}/vobiz-respond"
+            method="POST"
+            maxLength="15"
+            timeout="1"
+            playBeep="false" />
     <Redirect method="POST">{BASE_URL}/vobiz-silent</Redirect>
 </Response>"""
     return Response(content=xml, media_type="text/xml", headers=get_cloudflare_headers())
