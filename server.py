@@ -141,6 +141,18 @@ DB_FILE = "gunivox.db"
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    # Ensure columns exist (Migration)
+    c.execute("PRAGMA table_info(calls)")
+    cols = [col[1] for col in c.fetchall()]
+    if 'stage' not in cols:
+        c.execute("ALTER TABLE calls ADD COLUMN stage TEXT DEFAULT 'Cold Call'")
+    if 'duration_seconds' not in cols:
+        c.execute("ALTER TABLE calls ADD COLUMN duration_seconds INTEGER DEFAULT 0")
+    if 'billable_minutes' not in cols:
+        c.execute("ALTER TABLE calls ADD COLUMN billable_minutes REAL DEFAULT 0")
+    if 'ended_at' not in cols:
+        c.execute("ALTER TABLE calls ADD COLUMN ended_at TEXT")
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS calls (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
