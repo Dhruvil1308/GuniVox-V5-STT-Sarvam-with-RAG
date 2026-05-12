@@ -23,7 +23,9 @@ import {
   Plus,
   Search,
   Calendar,
-  Trash
+  Trash,
+  Timer,
+  Workflow
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
@@ -51,6 +53,18 @@ interface Stats {
   total_calls: number;
   positive_leads: number;
   recent_calls: CallLog[];
+  pipeline_stats?: Record<string, number>;
+}
+
+interface Lead {
+  phone_number: string;
+  stage: string;
+  last_call_sid: string;
+  updated_at: string;
+  user_name?: string;
+  interest?: string;
+  lead_status?: string;
+  transcript?: string;
 }
 
 interface CampaignResult {
@@ -72,14 +86,33 @@ interface CampaignProgress {
   results: CampaignResult[];
 }
 
+interface NumberMinutes {
+  phone_number: string;
+  calls: number;
+  total_actual_seconds: number;
+  billable_minutes: number;
+}
+
+interface MinutesData {
+  summary: {
+    total_billable_minutes: number;
+    total_calls_counted: number;
+    active_calls: number;
+  };
+  per_number: NumberMinutes[];
+}
+
 const App: React.FC = () => {
   // --- STATE ---
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [activeView, setActiveView] = useState<'dialer' | 'analytics' | 'courses'>('dialer');
+  const [activeView, setActiveView] = useState<'dialer' | 'pipeline' | 'analytics' | 'courses' | 'minutes'>('dialer');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
+
+  // Minutes State
+  const [minutesData, setMinutesData] = useState<MinutesData | null>(null);
 
   // Dialer State
   const [phoneNumber, setPhoneNumber] = useState("");
@@ -95,6 +128,7 @@ const App: React.FC = () => {
   // Analytics State
   const [stats, setStats] = useState<Stats | null>(null);
   const [logs, setLogs] = useState<CallLog[]>([]);
+  const [leads, setLeads] = useState<Lead[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
@@ -104,15 +138,23 @@ const App: React.FC = () => {
   interface Course {
     id?: number;
     name: string;
-    description: string;
+    institute: string;
+    duration: string;
     fees: string;
+    eligibility: string;
+    counsellor: string;
+    phone: string;
     brochure_url?: string;
   }
   const [courses, setCourses] = useState<Course[]>([]);
   const [isCourseModalOpen, setIsCourseModalOpen] = useState(false);
 
-  const [currentCourse, setCurrentCourse] = useState<Course>({ name: '', description: '', fees: '' });
+  const [currentCourse, setCurrentCourse] = useState<Course>({ 
+    name: '', institute: '', duration: '', fees: '', 
+    eligibility: '', counsellor: '', phone: '' 
+  });
   const [isEditingCourse, setIsEditingCourse] = useState(false);
+  const [courseSearchQuery, setCourseSearchQuery] = useState("");
   const visualizerBars = useMemo(
     () =>
       Array.from({ length: 16 }, (_, i) => ({
@@ -250,6 +292,49 @@ const App: React.FC = () => {
     }
   };
 
+  const fetchLeads = async () => {
+    try {
+      const res = await api.get(`/api/leads`);
+      setLeads(res.data);
+    } catch (err) {
+      console.error("Failed to fetch leads");
+    }
+  };
+
+  const fetchMinutesData = async () => {
+    try {
+      const res = await api.get(`/api/minutes`);
+      setMinutesData(res.data);
+    } catch (err) {
+      console.error("Failed to fetch minutes data");
+    }
+  };
+
+  const handleDragStart = (e: React.DragEvent, phone: string) => {
+    e.dataTransfer.setData("phone", phone);
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+  };
+
+  const handleDrop = async (e: React.DragEvent, stageId: string) => {
+    e.preventDefault();
+    const phone = e.dataTransfer.getData("phone");
+    if (!phone) return;
+
+    // Optimistic UI update
+    setLeads(prev => prev.map(l => l.phone_number === phone ? { ...l, stage: stageId } : l));
+
+    try {
+      await api.put(`/api/leads/${encodeURIComponent(phone)}/stage`, { stage: stageId });
+    } catch (err) {
+      console.error("Failed to update lead stage", err);
+      fetchLeads(); // Revert back on error
+    }
+  };
+
   const handleDeleteLog = async (e: React.MouseEvent, id: number) => {
     e.stopPropagation();
     if (!window.confirm("Are you sure you want to delete this log?")) return;
@@ -304,7 +389,10 @@ const App: React.FC = () => {
   };
 
   const resetCourseForm = () => {
-    setCurrentCourse({ name: '', description: '', fees: '' });
+    setCurrentCourse({ 
+      name: '', institute: '', duration: '', fees: '', 
+      eligibility: '', counsellor: '', phone: '' 
+    });
     setIsEditingCourse(false);
   };
 
@@ -322,8 +410,15 @@ const App: React.FC = () => {
       fetchStats();
       fetchLogs();
       interval = setInterval(() => { fetchStats(); fetchLogs(); }, 5000);
+    } else if (activeView === 'pipeline') {
+      fetchStats();
+      fetchLeads();
+      interval = setInterval(() => { fetchStats(); fetchLeads(); }, 5000);
     } else if (activeView === 'courses') {
       fetchCourses();
+    } else if (activeView === 'minutes') {
+      fetchMinutesData();
+      interval = setInterval(fetchMinutesData, 5000);
     }
     return () => clearInterval(interval);
   }, [activeView, searchQuery, startDate, endDate]); // Re-fetch logs when search or date changes
@@ -501,6 +596,14 @@ const App: React.FC = () => {
               <span className="font-semibold relative z-10">Smart Dialer</span>
             </button>
             <button
+              onClick={() => setActiveView('pipeline')}
+              className={`w-full group flex items-center gap-4 px-4 py-3.5 rounded-2xl transition-all duration-300 relative overflow-hidden ${activeView === 'pipeline' ? 'bg-orange-600/20 text-orange-200' : 'hover:bg-slate-800/50 text-slate-400 hover:text-white'}`}
+            >
+              {activeView === 'pipeline' && <motion.div layoutId="activeNav" className="absolute inset-0 bg-orange-600/10 border border-orange-500/20 rounded-2xl" />}
+              <Workflow size={20} className={activeView === 'pipeline' ? 'text-orange-400' : ''} />
+              <span className="font-semibold relative z-10">Lead Flow</span>
+            </button>
+            <button
               onClick={() => setActiveView('analytics')}
               className={`w-full group flex items-center gap-4 px-4 py-3.5 rounded-2xl transition-all duration-300 relative overflow-hidden ${activeView === 'analytics' ? 'bg-purple-600/20 text-purple-200' : 'hover:bg-slate-800/50 text-slate-400 hover:text-white'}`}
             >
@@ -515,6 +618,14 @@ const App: React.FC = () => {
               {activeView === 'courses' && <motion.div layoutId="activeNav" className="absolute inset-0 bg-emerald-600/10 border border-emerald-500/20 rounded-2xl" />}
               <BookOpen size={20} className={activeView === 'courses' ? 'text-emerald-400' : ''} />
               <span className="font-semibold relative z-10">Courses</span>
+            </button>
+            <button
+              onClick={() => setActiveView('minutes')}
+              className={`w-full group flex items-center gap-4 px-4 py-3.5 rounded-2xl transition-all duration-300 relative overflow-hidden ${activeView === 'minutes' ? 'bg-cyan-600/20 text-cyan-200' : 'hover:bg-slate-800/50 text-slate-400 hover:text-white'}`}
+            >
+              {activeView === 'minutes' && <motion.div layoutId="activeNav" className="absolute inset-0 bg-cyan-600/10 border border-cyan-500/20 rounded-2xl" />}
+              <Timer size={20} className={activeView === 'minutes' ? 'text-cyan-400' : ''} />
+              <span className="font-semibold relative z-10">Minutes</span>
             </button>
           </nav>
         </div>
@@ -540,10 +651,10 @@ const App: React.FC = () => {
                 key={activeView}
                 className="text-3xl font-bold text-white tracking-tight"
               >
-                {activeView === 'dialer' ? "Command Center" : "Intelligence Reports"}
+                {activeView === 'dialer' ? 'Command Center' : activeView === 'minutes' ? 'Minutes Dashboard' : 'Intelligence Reports'}
               </motion.h2>
               <p className="text-slate-400 mt-1 font-medium">
-                {activeView === 'dialer' ? "Manage outbound communications." : activeView === 'analytics' ? "Analyze performance metrics." : "Manage university programs."}
+                {activeView === 'dialer' ? 'Manage outbound communications.' : activeView === 'analytics' ? 'Analyze performance metrics.' : activeView === 'minutes' ? 'Live billable minute tracking per number.' : 'Manage university programs.'}
               </p>
             </div>
             <div className="flex items-center gap-3 px-4 py-2 bg-emerald-500/10 text-emerald-300 rounded-full text-sm font-bold border border-emerald-500/20 backdrop-blur-sm shadow-lg shadow-emerald-500/10">
@@ -743,6 +854,83 @@ const App: React.FC = () => {
                 </div>
               </motion.div>
             )}
+            {activeView === 'pipeline' && (
+              <motion.div
+                key="pipeline"
+                initial={{ opacity: 0, scale: 0.95 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.95 }}
+                className="h-full flex flex-col"
+              >
+                <div className="flex flex-wrap gap-4 items-center justify-between bg-slate-900/50 p-6 rounded-3xl border border-white/10 backdrop-blur-md mb-6">
+                    <div>
+                        <h2 className="text-xl font-bold text-white mb-1">Lead Flow Pipeline</h2>
+                        <p className="text-slate-400 text-sm">Leads automatically move through these stages based on conversation outcomes.</p>
+                    </div>
+                </div>
+
+                <div className="flex-1 overflow-x-auto min-h-[600px] flex gap-6 pb-6 items-start hide-scrollbar">
+                  
+                  {[
+                    { id: 'Cold Call',       title: 'Cold Call',        color: 'blue'   },
+                    { id: 'Warm Call',       title: 'Warm Call',        color: 'orange' },
+                    { id: 'Hot Call',        title: 'Hot Call',         color: 'red'    },
+                    { id: 'DNC',             title: 'DNC',              color: 'slate'  },
+                    { id: 'Unanswered Cold', title: 'Unanswered (Cold)', color: 'slate' },
+                    { id: 'Unanswered Warm', title: 'Unanswered (Warm)', color: 'slate' },
+                    { id: 'Unanswered Hot',  title: 'Unanswered (Hot)',  color: 'slate' },
+                  ].map(col => {
+                    const colLeads = leads.filter(l => l.stage === col.id);
+                    return (
+                      <div key={col.id} className={`w-80 shrink-0 flex flex-col bg-slate-900/60 backdrop-blur-xl border border-${col.color}-500/20 rounded-[2rem] overflow-hidden`}>
+                        <div className={`bg-${col.color}-900/40 px-6 py-5 border-b border-${col.color}-500/20 flex justify-between items-center sticky top-0 z-10`}>
+                          <h3 className={`font-bold text-${col.color}-100`}>{col.title}</h3>
+                          <span className={`bg-${col.color}-500/20 text-${col.color}-300 text-xs px-3 py-1.5 rounded-full font-bold`}>
+                            {colLeads.length}
+                          </span>
+                        </div>
+                        <div 
+                          className="p-4 flex-1 overflow-y-auto space-y-4 min-h-[200px] max-h-[650px] scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent"
+                          onDragOver={handleDragOver}
+                          onDrop={(e) => handleDrop(e, col.id)}
+                        >
+                           <AnimatePresence>
+                            {colLeads.map(lead => (
+                              <motion.div 
+                                layout
+                                draggable
+                                onDragStart={(e) => handleDragStart(e as unknown as React.DragEvent, lead.phone_number)}
+                                initial={{ opacity: 0, y: 10 }}
+                                animate={{ opacity: 1, y: 0 }}
+                                exit={{ opacity: 0, scale: 0.9 }}
+                                key={lead.phone_number} 
+                                className={`cursor-grab active:cursor-grabbing bg-slate-950/80 p-5 rounded-2xl border border-slate-800 hover:border-${col.color}-500/40 transition-colors shadow-lg group`}
+                              >
+                                <div className="flex justify-between items-start mb-3">
+                                  <div className={`font-mono text-sm text-${col.color}-300 font-bold group-hover:text-${col.color}-200 transition-colors`}>{lead.phone_number}</div>
+                                  <div className="text-[10px] text-slate-500 bg-slate-900 px-2 py-1 rounded-md">{new Date(lead.updated_at).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</div>
+                                </div>
+                                <div className="text-white text-sm font-medium mb-1 truncate">{lead.user_name || "Unknown User"}</div>
+                                <div className="flex flex-wrap gap-2 mt-4 pt-4 border-t border-slate-800">
+                                  {lead.interest && lead.interest !== 'Unknown' && <span className="bg-slate-900 text-blue-300 text-[10px] px-2 py-1 rounded-md font-medium">{lead.interest}</span>}
+                                  {lead.lead_status && lead.lead_status !== 'Unknown' && <span className={`bg-slate-900 text-[10px] px-2 py-1 rounded-md font-medium text-${col.color}-300`}>{lead.lead_status}</span>}
+                                </div>
+                              </motion.div>
+                            ))}
+                          </AnimatePresence>
+                          {colLeads.length === 0 && (
+                            <div className="h-full flex items-center justify-center text-slate-600 text-sm py-12 border-2 border-dashed border-slate-800/50 rounded-2xl">
+                              Drop zone
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                  
+                </div>
+              </motion.div>
+            )}
             {activeView === 'analytics' && (
               <motion.div
                 key="analytics"
@@ -904,6 +1092,158 @@ const App: React.FC = () => {
                 </div>
               </motion.div>
             )}
+            {activeView === 'minutes' && (() => {
+              const fmtSecs = (s: number) => {
+                const m = Math.floor(s / 60);
+                const sec = s % 60;
+                return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+              };
+              return (
+                <motion.div
+                  key="minutes"
+                  initial={{ opacity: 0, x: 20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  exit={{ opacity: 0, x: -20 }}
+                  className="space-y-8"
+                >
+                  {/* Header Bar */}
+                  <div className="flex flex-wrap gap-4 items-center justify-between bg-slate-900/50 p-6 rounded-3xl border border-white/10 backdrop-blur-md">
+                    <div>
+                      <h2 className="text-xl font-bold text-white mb-1">Billing Minutes Dashboard</h2>
+                      <p className="text-slate-400 text-sm">Live per-number call duration tracking with billable minute rounding. Auto-refreshes every 5s.</p>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      {(minutesData?.summary.active_calls ?? 0) > 0 && (
+                        <div className="flex items-center gap-2 px-4 py-2 bg-emerald-500/10 text-emerald-300 rounded-full text-sm font-bold border border-emerald-500/20">
+                          <span className="relative flex h-2 w-2">
+                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                            <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                          </span>
+                          {minutesData!.summary.active_calls} Call{minutesData!.summary.active_calls !== 1 ? 's' : ''} Live
+                        </div>
+                      )}
+                      <div className="text-xs text-slate-600 font-mono bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-800">⟳ 5s refresh</div>
+                    </div>
+                  </div>
+
+                  {/* Summary Cards */}
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-5">
+                    <motion.div whileHover={{ y: -4 }} className="bg-slate-900/60 backdrop-blur-md p-6 rounded-2xl border border-cyan-500/20 shadow-lg relative overflow-hidden">
+                      <div className="absolute top-0 right-0 p-4 opacity-10 text-cyan-400"><Timer size={56} /></div>
+                      <p className="text-cyan-400 text-xs font-bold uppercase tracking-wider">Total Billable</p>
+                      <h3 className="text-4xl font-bold text-white mt-2">
+                        {minutesData?.summary.total_billable_minutes ?? 0}
+                        <span className="text-base text-slate-400 ml-1 font-normal">min</span>
+                      </h3>
+                      <p className="text-xs text-slate-500 mt-2">Across all numbers</p>
+                    </motion.div>
+
+                    <motion.div whileHover={{ y: -4 }} className="bg-slate-900/60 backdrop-blur-md p-6 rounded-2xl border border-blue-500/20 shadow-lg relative overflow-hidden">
+                      <div className="absolute top-0 right-0 p-4 opacity-10 text-blue-400"><Phone size={56} /></div>
+                      <p className="text-blue-400 text-xs font-bold uppercase tracking-wider">Calls Counted</p>
+                      <h3 className="text-4xl font-bold text-white mt-2">{minutesData?.summary.total_calls_counted ?? 0}</h3>
+                      <p className="text-xs text-slate-500 mt-2">With recorded duration</p>
+                    </motion.div>
+
+                    <motion.div whileHover={{ y: -4 }} className="bg-slate-900/60 backdrop-blur-md p-6 rounded-2xl border border-purple-500/20 shadow-lg relative overflow-hidden">
+                      <div className="absolute top-0 right-0 p-4 opacity-10 text-purple-400"><Activity size={56} /></div>
+                      <p className="text-purple-400 text-xs font-bold uppercase tracking-wider">Avg Duration</p>
+                      <h3 className="text-4xl font-bold text-white mt-2">
+                        {minutesData && minutesData.summary.total_calls_counted > 0
+                          ? fmtSecs(Math.round(
+                              (minutesData.per_number.reduce((a, n) => a + n.total_actual_seconds, 0)) /
+                              minutesData.summary.total_calls_counted
+                            ))
+                          : '—'}
+                      </h3>
+                      <p className="text-xs text-slate-500 mt-2">Per answered call</p>
+                    </motion.div>
+                  </div>
+
+                  {/* Rounding Legend */}
+                  <div className="flex flex-wrap gap-3 px-6 py-4 bg-slate-900/40 rounded-2xl border border-white/5 text-xs font-mono">
+                    <span className="text-slate-500 font-bold uppercase tracking-wider mr-2">Rounding Rules:</span>
+                    <span className="bg-cyan-900/40 text-cyan-300 px-3 py-1 rounded-lg border border-cyan-500/20">1–30s → 0.5 min</span>
+                    <span className="bg-blue-900/40 text-blue-300 px-3 py-1 rounded-lg border border-blue-500/20">31–60s → 1 min</span>
+                  </div>
+
+                  {/* Per-Number Table */}
+                  <div className="bg-slate-900/50 backdrop-blur-md rounded-3xl border border-white/10 overflow-hidden shadow-2xl">
+                    <div className="px-8 py-5 border-b border-white/5 flex justify-between items-center bg-white/[0.02]">
+                      <h3 className="font-bold text-lg text-white flex items-center gap-2">
+                        <Timer size={18} className="text-cyan-400" /> Per-Number Billing Breakdown
+                      </h3>
+                      <span className="text-xs text-slate-500 font-mono">{minutesData?.per_number.length ?? 0} Numbers</span>
+                    </div>
+                    <div className="overflow-x-auto max-h-[520px] overflow-y-auto">
+                      <table className="w-full text-sm text-left">
+                        <thead className="bg-slate-950 text-slate-400 font-semibold border-b border-white/5 sticky top-0 z-10">
+                          <tr>
+                            <th className="px-8 py-4">Phone Number</th>
+                            <th className="px-6 py-4 text-center">Calls</th>
+                            <th className="px-6 py-4 text-center">Actual Duration</th>
+                            <th className="px-6 py-4 text-center">Billable Minutes</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-white/5">
+                          {(minutesData?.per_number ?? []).map((row, idx) => (
+                            <motion.tr
+                              key={row.phone_number}
+                              initial={{ opacity: 0, y: 6 }}
+                              animate={{ opacity: 1, y: 0 }}
+                              transition={{ delay: idx * 0.03 }}
+                              className="hover:bg-white/[0.04] transition-colors group"
+                            >
+                              <td className="px-8 py-4 font-mono text-cyan-300 group-hover:text-cyan-200 transition-colors">{row.phone_number}</td>
+                              <td className="px-6 py-4 text-center">
+                                <span className="bg-blue-500/10 text-blue-300 text-xs font-bold px-2 py-1 rounded-lg border border-blue-500/20">{row.calls}</span>
+                              </td>
+                              <td className="px-6 py-4 text-center text-slate-300 font-mono">{fmtSecs(row.total_actual_seconds)}</td>
+                              <td className="px-6 py-4 text-center">
+                                <span className={`font-bold text-base ${row.billable_minutes >= 2 ? 'text-amber-300' : 'text-cyan-300'}`}>
+                                  {row.billable_minutes}
+                                </span>
+                                <span className="text-slate-500 text-xs ml-1">min</span>
+                              </td>
+                            </motion.tr>
+                          ))}
+                          {(!minutesData || minutesData.per_number.length === 0) && (
+                            <tr>
+                              <td colSpan={4} className="text-center py-16">
+                                <div className="flex flex-col items-center gap-3 text-slate-600">
+                                  <Timer size={40} className="opacity-20" />
+                                  <p className="text-sm">No completed calls with duration data yet.</p>
+                                  <p className="text-xs">Data appears here as calls end.</p>
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                        </tbody>
+                        {minutesData && minutesData.per_number.length > 0 && (
+                          <tfoot className="bg-slate-950/80 border-t border-white/10 sticky bottom-0">
+                            <tr>
+                              <td className="px-8 py-4 text-slate-400 font-bold text-xs uppercase tracking-wider">Total</td>
+                              <td className="px-6 py-4 text-center">
+                                <span className="bg-blue-500/10 text-blue-300 text-xs font-bold px-2 py-1 rounded-lg border border-blue-500/20">
+                                  {minutesData.summary.total_calls_counted}
+                                </span>
+                              </td>
+                              <td className="px-6 py-4 text-center text-slate-500 font-mono text-xs">
+                                {fmtSecs(minutesData.per_number.reduce((a, n) => a + n.total_actual_seconds, 0))}
+                              </td>
+                              <td className="px-6 py-4 text-center">
+                                <span className="text-cyan-300 font-bold text-lg">{minutesData.summary.total_billable_minutes}</span>
+                                <span className="text-slate-500 text-xs ml-1">min</span>
+                              </td>
+                            </tr>
+                          </tfoot>
+                        )}
+                      </table>
+                    </div>
+                  </div>
+                </motion.div>
+              );
+            })()}
             {activeView === 'courses' && (
               <motion.div
                 key="courses"
@@ -912,43 +1252,78 @@ const App: React.FC = () => {
                 exit={{ opacity: 0, x: -20 }}
                 className="space-y-6"
               >
-                <div className="flex justify-end">
+                <div className="flex flex-col md:flex-row justify-between items-center gap-4">
+                  <div className="relative flex-1 w-full">
+                    <Search className="absolute left-4 top-3.5 text-slate-500" size={20} />
+                    <input
+                      type="text"
+                      placeholder="Search Courses..."
+                      value={courseSearchQuery}
+                      onChange={(e) => setCourseSearchQuery(e.target.value)}
+                      className="w-full bg-slate-900/50 border border-white/10 rounded-xl pl-12 pr-4 py-3 text-white focus:ring-2 focus:ring-emerald-500/50 outline-none"
+                    />
+                  </div>
                   <button
                     onClick={() => { resetCourseForm(); setIsCourseModalOpen(true); }}
-                    className="bg-emerald-600 hover:bg-emerald-500 text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2 shadow-lg shadow-emerald-900/20 transition-all"
+                    className="bg-emerald-600 hover:bg-emerald-500 text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2 shadow-lg shadow-emerald-900/20 transition-all shrink-0"
                   >
                     <Plus size={20} /> Add New Course
                   </button>
                 </div>
 
                 <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
-                  {courses.map((course) => (
-                    <motion.div
-                      layout
-                      key={course.id}
-                      className="bg-slate-900/50 backdrop-blur-md border border-white/10 rounded-2xl p-6 hover:border-emerald-500/30 transition-all group"
-                    >
-                      <div className="flex justify-between items-start mb-4">
-                        <div className="p-3 bg-emerald-500/10 rounded-xl text-emerald-400">
-                          <BookOpen size={24} />
+                  {courses.filter(c => 
+                    c.name.toLowerCase().includes(courseSearchQuery.toLowerCase()) || 
+                    c.institute.toLowerCase().includes(courseSearchQuery.toLowerCase()) ||
+                    c.eligibility.toLowerCase().includes(courseSearchQuery.toLowerCase())
+                  ).map((course) => {
+                    return (
+                      <motion.div
+                        layout
+                        key={course.id}
+                        className="bg-slate-900/50 backdrop-blur-md border border-white/10 rounded-2xl p-6 hover:border-emerald-500/30 transition-all group flex flex-col"
+                      >
+                        <div className="flex justify-between items-start mb-4">
+                          <div className="p-3 bg-emerald-500/10 rounded-xl text-emerald-400">
+                            <BookOpen size={24} />
+                          </div>
+                          <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                            <button onClick={() => openEditCourse(course)} className="p-2 hover:bg-white/10 rounded-lg text-blue-400 transition-colors"><Edit2 size={18} /></button>
+                            <button onClick={() => handleDeleteCourse(course.id!)} className="p-2 hover:bg-white/10 rounded-lg text-red-400 transition-colors"><Trash2 size={18} /></button>
+                          </div>
                         </div>
-                        <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                          <button onClick={() => openEditCourse(course)} className="p-2 hover:bg-white/10 rounded-lg text-blue-400 transition-colors"><Edit2 size={18} /></button>
-                          <button onClick={() => handleDeleteCourse(course.id!)} className="p-2 hover:bg-white/10 rounded-lg text-red-400 transition-colors"><Trash2 size={18} /></button>
+                        <h3 className="text-xl font-bold text-white mb-2 leading-tight">{course.name}</h3>
+                        
+                        <div className="space-y-2 mb-4 flex-1">
+                          <div className="flex items-center gap-2 text-xs text-slate-400">
+                            <ShieldCheck size={14} className="text-blue-400" />
+                            <span className="font-medium text-slate-300">{course.institute}</span>
+                          </div>
+                          <div className="flex items-center gap-2 text-xs text-slate-400">
+                            <Clock size={14} className="text-amber-400" />
+                            <span className="text-slate-300">{course.duration}</span>
+                          </div>
+                          <div className="flex items-start gap-2 text-xs text-slate-400">
+                            <CheckCircle size={14} className="text-emerald-400 mt-0.5 shrink-0" />
+                            <span className="text-slate-300 leading-relaxed">{course.eligibility}</span>
+                          </div>
+                          <div className="flex items-center gap-2 text-xs text-slate-400 pt-2 border-t border-white/5 mt-2">
+                            <User size={14} className="text-purple-400" />
+                            <span className="text-slate-300">{course.counsellor} • {course.phone}</span>
+                          </div>
                         </div>
-                      </div>
-                      <h3 className="text-xl font-bold text-white mb-2">{course.name}</h3>
-                      <p className="text-slate-400 text-sm mb-4 line-clamp-2">{course.description}</p>
-                      <div className="flex items-center justify-between mt-auto pt-4 border-t border-white/5">
-                        <span className="text-emerald-400 font-mono font-bold">{course.fees}</span>
-                        {course.brochure_url && (
-                          <a href={course.brochure_url} target="_blank" rel="noreferrer" className="text-xs text-blue-400 hover:underline flex items-center gap-1">
-                            View Brochure <Download size={12} />
-                          </a>
-                        )}
-                      </div>
-                    </motion.div>
-                  ))}
+
+                        <div className="flex items-center justify-between mt-auto pt-4 border-t border-white/5">
+                          <span className="text-emerald-400 font-mono font-bold text-lg">{course.fees}</span>
+                          {course.brochure_url && (
+                            <a href={course.brochure_url} target="_blank" rel="noreferrer" className="text-xs text-blue-400 hover:underline flex items-center gap-1">
+                              Brochure <Download size={12} />
+                            </a>
+                          )}
+                        </div>
+                      </motion.div>
+                    );
+                  })}
                   {courses.length === 0 && (
                     <div className="col-span-full text-center py-20 text-slate-500">
                       <BookOpen size={48} className="mx-auto mb-4 opacity-20" />
@@ -993,6 +1368,30 @@ const App: React.FC = () => {
                     placeholder="e.g. B.Tech Computer Engineering"
                   />
                 </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-slate-400 text-xs font-bold uppercase tracking-wider mb-1">Institute</label>
+                    <input
+                      required
+                      type="text"
+                      value={currentCourse.institute}
+                      onChange={e => setCurrentCourse({ ...currentCourse, institute: e.target.value })}
+                      className="w-full bg-slate-950/50 border border-slate-700/50 rounded-xl px-4 py-3 text-white focus:ring-2 focus:ring-emerald-500/50 outline-none"
+                      placeholder="e.g. UVPCE"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-400 text-xs font-bold uppercase tracking-wider mb-1">Duration</label>
+                    <input
+                      required
+                      type="text"
+                      value={currentCourse.duration}
+                      onChange={e => setCurrentCourse({ ...currentCourse, duration: e.target.value })}
+                      className="w-full bg-slate-950/50 border border-slate-700/50 rounded-xl px-4 py-3 text-white focus:ring-2 focus:ring-emerald-500/50 outline-none"
+                      placeholder="e.g. 4 Year"
+                    />
+                  </div>
+                </div>
                 <div>
                   <label className="block text-slate-400 text-xs font-bold uppercase tracking-wider mb-1">Yearly Fees</label>
                   <input
@@ -1005,14 +1404,38 @@ const App: React.FC = () => {
                   />
                 </div>
                 <div>
-                  <label className="block text-slate-400 text-xs font-bold uppercase tracking-wider mb-1">Description</label>
+                  <label className="block text-slate-400 text-xs font-bold uppercase tracking-wider mb-1">Eligibility</label>
                   <textarea
                     required
-                    value={currentCourse.description}
-                    onChange={e => setCurrentCourse({ ...currentCourse, description: e.target.value })}
-                    className="w-full bg-slate-950/50 border border-slate-700/50 rounded-xl px-4 py-3 text-white focus:ring-2 focus:ring-emerald-500/50 outline-none h-24 resize-none"
-                    placeholder="Short description of the course..."
+                    value={currentCourse.eligibility}
+                    onChange={e => setCurrentCourse({ ...currentCourse, eligibility: e.target.value })}
+                    className="w-full bg-slate-950/50 border border-slate-700/50 rounded-xl px-4 py-3 text-white focus:ring-2 focus:ring-emerald-500/50 outline-none h-20 resize-none"
+                    placeholder="e.g. 12th PCM 45%..."
                   />
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-slate-400 text-xs font-bold uppercase tracking-wider mb-1">Counsellor Name</label>
+                    <input
+                      required
+                      type="text"
+                      value={currentCourse.counsellor}
+                      onChange={e => setCurrentCourse({ ...currentCourse, counsellor: e.target.value })}
+                      className="w-full bg-slate-950/50 border border-slate-700/50 rounded-xl px-4 py-3 text-white focus:ring-2 focus:ring-emerald-500/50 outline-none"
+                      placeholder="Name"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-400 text-xs font-bold uppercase tracking-wider mb-1">Phone</label>
+                    <input
+                      required
+                      type="text"
+                      value={currentCourse.phone}
+                      onChange={e => setCurrentCourse({ ...currentCourse, phone: e.target.value })}
+                      className="w-full bg-slate-950/50 border border-slate-700/50 rounded-xl px-4 py-3 text-white focus:ring-2 focus:ring-emerald-500/50 outline-none"
+                      placeholder="Digits with spaces"
+                    />
+                  </div>
                 </div>
                 <div>
                   <label className="block text-slate-400 text-xs font-bold uppercase tracking-wider mb-1">Brochure URL (Optional)</label>

@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
@@ -112,21 +113,28 @@ def format_voice_context(record: dict, score: float) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # Index build / load
 # ─────────────────────────────────────────────────────────────────────────────
-def build_index_from_json(json_path: str = 'final_dataset.json') -> bool:
-    """Build and persist the FAISS index from the programme dataset."""
-    logger.info(f"Building FAISS index from '{json_path}'…")
-
-    if not os.path.exists(json_path):
-        raise FileNotFoundError(f"Dataset not found: {json_path}")
-
-    with open(json_path, 'r', encoding='utf-8') as f:
-        dataset = json.load(f)
-
+def build_index_from_list(dataset: list[dict]) -> bool:
+    """Build and persist the FAISS index from a list of programme records."""
     if not dataset:
         logger.warning("Dataset is empty — cannot build index.")
         return False
 
-    texts = [format_record(r) for r in dataset]
+    # Standardize records for formatting
+    # If coming from DB, keys might be different. 
+    # format_record expects: program, institute, duration, fees, eligibility, counsellor_name, counsellor_phone
+    standardized = []
+    for r in dataset:
+        standardized.append({
+            'program': r.get('name') or r.get('program') or 'Unknown Program',
+            'institute': r.get('institute') or 'Unknown Institute',
+            'duration': r.get('duration') or 'N/A',
+            'fees': r.get('fees'),
+            'eligibility': r.get('eligibility'),
+            'counsellor_name': r.get('counsellor') or r.get('counsellor_name') or 'N/A',
+            'counsellor_phone': r.get('phone') or r.get('counsellor_phone') or 'N/A'
+        })
+
+    texts = [format_record(r) for r in standardized]
 
     model = get_model()
     logger.info(f"Generating {len(texts)} embeddings…")
@@ -135,13 +143,11 @@ def build_index_from_json(json_path: str = 'final_dataset.json') -> bool:
         show_progress_bar=True,
         convert_to_numpy=True,
         batch_size=64,
-        normalize_embeddings=True,   # already unit-norm → skip extra L2 step
+        normalize_embeddings=True,
     )
 
-    # Normalise for cosine similarity via IndexFlatIP
     faiss.normalize_L2(embeddings)
-
-    dim   = embeddings.shape[1]
+    dim = embeddings.shape[1]
     index = faiss.IndexFlatIP(dim)
     index.add(embeddings)
 
@@ -149,10 +155,38 @@ def build_index_from_json(json_path: str = 'final_dataset.json') -> bool:
     faiss.write_index(index, INDEX_FILE)
 
     with open(METADATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(dataset, f, ensure_ascii=False, indent=2)
+        json.dump(standardized, f, ensure_ascii=False, indent=2)
 
-    logger.info(f"✅ FAISS index built: {len(dataset)} vectors → {INDEX_FILE}")
+    logger.info(f"✅ FAISS index built: {len(standardized)} vectors → {INDEX_FILE}")
     return True
+
+
+def build_index_from_json(json_path: str = 'final_dataset.json') -> bool:
+    """Build from the JSON file."""
+    if not os.path.exists(json_path):
+        logger.warning(f"JSON dataset not found: {json_path}")
+        return False
+    with open(json_path, 'r', encoding='utf-8') as f:
+        dataset = json.load(f)
+    return build_index_from_list(dataset)
+
+
+def build_index_from_db(db_path: str = 'gunivox.db') -> bool:
+    """Build from the SQLite courses table."""
+    if not os.path.exists(db_path):
+        logger.warning(f"Database not found: {db_path}")
+        return False
+    try:
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute("SELECT name, institute, duration, fees, eligibility, counsellor, phone FROM courses")
+        columns = [d[0] for d in c.description]
+        dataset = [dict(zip(columns, row)) for row in c.fetchall()]
+        conn.close()
+        return build_index_from_list(dataset)
+    except Exception as e:
+        logger.error(f"DB index build error: {e}")
+        return False
 
 
 def load_index(force_rebuild: bool = False, json_path: str = 'final_dataset.json') -> None:

@@ -3,10 +3,9 @@ Version=1.0
 Name=GuniVox V3
 GenericName=AI Voice Agent
 Comment=Start the GuniVox V3 AI Voice Agent for Ganpat University
-Exec=bash -c "cd '/home/dhruvil/GuniVox V3/GuniVox V3' && bash start_gunivox.sh"
+Exec=bash -c "cd '/home/dhruvil/GuniVox V3/GuniVox V3' && ./start_multi.sh"
 Icon=/home/dhruvil/GuniVox V3/GuniVox V3/static/gunivox_icon.png
-Terminal=true
+Terminal=false
 Type=Application
 Categories=Development;
 StartupNotify=true
-00

@@ -17,13 +17,13 @@ dist/
 dist-ssr/
 
 # Database (recreated on each deploy)
-gunivox.db
-leads.xlsx
+*.db
+*.xlsx
 
 # Audio temp files
 static/audio/
-temp_*.mp3
-temp_*.wav
+*.mp3
+*.wav
 
 # Piper voice models (downloaded at build time via build.sh)
 piper_voices/*.onnx
