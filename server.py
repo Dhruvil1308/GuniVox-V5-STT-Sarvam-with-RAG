@@ -698,12 +698,14 @@ async def gather_xml(request: Request, speak_text: str, action_path: str, lang: 
     audio_url = await generate_tts_audio(speak_text, BASE_URL, lang)
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Play>{audio_url}</Play>
-    <Record action="{BASE_URL}/{action_path}"
-            method="POST"
-            maxLength="15"
-            timeout="{timeout}"
-            playBeep="false" />
+    <Gather input="speech" 
+            action="{BASE_URL}/{action_path}" 
+            method="POST" 
+            speechTimeout="1.0" 
+            language="{lang}"
+            bargeIn="true">
+        <Play>{audio_url}</Play>
+    </Gather>
     <Redirect method="POST">{BASE_URL}/vobiz-silent</Redirect>
 </Response>"""
 
@@ -950,12 +952,14 @@ async def vobiz_answer(request: Request):
 
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Play>{audio_url}</Play>
-    <Record action="{BASE_URL}/vobiz-respond"
-            method="POST"
-            maxLength="15"
-            timeout="1"
-            playBeep="false" />
+    <Gather input="speech" 
+            action="{BASE_URL}/vobiz-respond" 
+            method="POST" 
+            speechTimeout="1.0" 
+            language="gu-IN" 
+            bargeIn="true">
+        <Play>{audio_url}</Play>
+    </Gather>
     <Redirect method="POST">{BASE_URL}/vobiz-silent</Redirect>
 </Response>"""
     return Response(content=xml, media_type="text/xml", headers=get_cloudflare_headers())
