@@ -107,34 +107,8 @@ app.add_middleware(
 os.makedirs("static/audio", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "dist")
-if os.path.isdir(os.path.join(FRONTEND_DIR, "assets")):
-    app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIR, "assets")), name="frontend_assets")
-
-@app.get("/")
-async def serve_index():
-    index_path = os.path.join(FRONTEND_DIR, "index.html")
-    if os.path.isfile(index_path):
-        return FileResponse(index_path)
-    return JSONResponse({"message": "GuniVox Backend is running. Frontend build not found."}, status_code=200)
-
-@app.get("/{full_path:path}")
-async def catch_all(full_path: str):
-    # If the path looks like a file (has extension), try to serve it or 404
-    if "." in full_path.split("/")[-1]:
-        file_path = os.path.join(FRONTEND_DIR, full_path)
-        if os.path.isfile(file_path):
-            return FileResponse(file_path)
-        return Response(status_code=404)
-    
-    # Otherwise, serve index.html for SPA routing
-    index_path = os.path.join(FRONTEND_DIR, "index.html")
-    if os.path.isfile(index_path):
-        return FileResponse(index_path)
-    return JSONResponse({"message": "Not Found"}, status_code=404)
-
 # ─────────────────────────────────────────
-# DATABASE (unchanged)
+# DATABASE (optimized)
 # ─────────────────────────────────────────
 DB_FILE = "gunivox.db"
 
@@ -1848,12 +1822,20 @@ async def favicon():
     return Response(status_code=204)
 
 
+# ─────────────────────────────────────────
+# FRONTEND SERVING (SPA Support)
+# ─────────────────────────────────────────
+FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "dist")
+
+if os.path.isdir(os.path.join(FRONTEND_DIR, "assets")):
+    app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIR, "assets")), name="frontend_assets")
+
 def _serve_frontend_index():
     index_path = os.path.join(FRONTEND_DIR, "index.html")
     if os.path.exists(index_path):
         return FileResponse(index_path, media_type="text/html")
-    return JSONResponse(content={"status": "ok", "service": "GuniVox V3 — frontend not built",
-                                  "hint": "Run 'npm run build' to generate the dist/ folder."})
+    return JSONResponse(content={"status": "ok", "service": "GuniVox V3 — backend is running",
+                                  "hint": "Run 'npm run build' to generate the dist/ folder for the UI."})
 
 @app.get("/")
 @app.head("/")
@@ -1862,13 +1844,19 @@ async def serve_root():
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "HEAD"])
 async def catch_all(request: Request, path: str):
+    # Prevent catching API routes (just in case they fall through)
+    if path.startswith("api/") or path.startswith("vobiz-") or path.startswith("status"):
+        return JSONResponse(content={"error": "Not Found"}, status_code=404)
+
     if request.method == "POST":
-        try:
-            form_data = dict(await request.form())
-        except Exception:
-            form_data = {}
-        logger.warning(f"⚠️ UNEXPECTED POST: /{path} | form={form_data}")
-        return JSONResponse(content={"received": True})
+        return JSONResponse(content={"received": True, "path": path})
+        
+    # Serve static files if they exist (for images, favicon, etc.)
+    file_path = os.path.join(FRONTEND_DIR, path)
+    if os.path.isfile(file_path):
+        return FileResponse(file_path)
+        
+    # Default to index.html for SPA routing
     return _serve_frontend_index()
 
 
