@@ -937,11 +937,27 @@ async def vobiz_answer(request: Request):
                 or form_data.get("CallSid") or "unknown")
     logger.info(f"   Call SID: {call_sid} | Payload: {form_data}")
 
-    xml = await gather_xml(
-        request,
-        "નમસ્તે! ગણપત યુનિવર્સિટીમાંથી ગણીવોક્સ વાત કરી રહી છું. શું તમે અત્યારે વાત કરવા માટે ઉપલબ્ધ છો?",
-        action_path="vobiz-respond", lang="gu-IN",
-    )
+    # ⚡ OPT: Use pre-generated greeting for 0ms latency
+    BASE_URL = get_base_url(request)
+    audio_url = f"{BASE_URL}/static/audio/greeting.wav"
+    
+    # We still keep the text for session initialization
+    greeting_text = "Hi, હું અનન્યા, Ganpat University તરફથી AI Career Assistant બોલું છું. ઘણા વિદ્યાર્થીઓને 10મા, 12મા અથવા Graduation પછી યોગ્ય career પસંદ કરવામાં મુશ્કેલી પડે છે. વિદ્યાર્થીઓને યોગ્ય માર્ગદર્શન આપવા માટે અમે તમારા શહેરમાં FREE One-to-One Career Counselling Session આયોજન કરી રહ્યા છીએ. શું તમને આ counselling sessionમાં જોડાવું ગમશે?"
+    sessions[call_sid] = [
+        {"role": "system", "content": get_system_prompt_with_courses()},
+        {"role": "assistant", "content": f"TEXT: {greeting_text} | LANG: gu-IN"}
+    ]
+
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Play>{audio_url}</Play>
+    <Record action="{BASE_URL}/vobiz-respond"
+            method="POST"
+            maxLength="15"
+            timeout="1"
+            playBeep="false" />
+    <Redirect method="POST">{BASE_URL}/vobiz-silent</Redirect>
+</Response>"""
     return Response(content=xml, media_type="text/xml", headers=get_cloudflare_headers())
 
 
