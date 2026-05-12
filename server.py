@@ -1201,14 +1201,17 @@ async def counsellor_answer(request: Request):
     conf_room = sessions.get(f"__conf__{call_sid}", f"gvx_{call_sid[-12:]}")
     BASE_URL  = get_base_url(request)
 
+    # ⚡ OPT: Hold music path
+    hold_music_url = f"{BASE_URL}/static/audio/goodvibes.mp3"
+
     logger.info(f"🤝 Counsellor answered | room={conf_room} | call_sid={call_sid} | data={form_data}")
 
-    # Brief the counsellor
-    briefing     = "Hello, this is GuniVox AI. A prospective student is waiting for career counselling. Connecting you now."
-    briefing_url = await generate_tts_audio(briefing, BASE_URL, lang="en-IN")
+    # Brief the counsellor exactly as requested
+    briefing = "ગણપત યુનિવર્સિટીના એડમિશનની ઇન્કવાયરી માટે સ્ટુડન્ટ તમારી સાથે વાત કરવા માંગે છે, હું કનેક્ટ કરી રહી છું."
+    briefing_url = await generate_tts_audio(briefing, BASE_URL, lang="gu-IN")
 
-    # Push user from /hold-loop into conference (with 1.5s delay so counsellor enters first)
-    asyncio.create_task(_push_user_to_conference(call_sid, BASE_URL, delay=1.5))
+    # Push user from /hold-loop into conference (with 1.8s delay for professional handover)
+    asyncio.create_task(_push_user_to_conference(call_sid, BASE_URL, delay=1.8))
 
     # Counsellor enters Conference room now (this creates the room on VoBiz)
     xml = (
