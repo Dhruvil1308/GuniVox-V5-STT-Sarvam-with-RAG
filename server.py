@@ -28,7 +28,7 @@ from io import StringIO, BytesIO
 import requests
 import base64
 import httpx                             # ⚡ OPT-4: async HTTP for TTS
-from fastapi import FastAPI, Request, HTTPException, UploadFile, File
+from fastapi import FastAPI, Request, HTTPException, UploadFile, File, WebSocket
 from fastapi.responses import Response, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -49,19 +49,94 @@ http_session = requests.Session()
 
 load_dotenv(".env.local")
 
-_executor = ThreadPoolExecutor(max_workers=8)  # ⚡ CAG-OPT: doubled workers
+# ⚡ OPT: Dedicated executors for different workloads
+_io_executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="io")
+_db_executor = ThreadPoolExecutor(max_workers=1,  thread_name_prefix="db") # SQLite is best with single-writer
+_faiss_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="faiss")
+
+# ⚡ OPT: Session management with locks and TTL
+sessions: Dict[str, List[Dict[str, str]]] = {}
+session_locks: Dict[str, asyncio.Lock] = {}
+session_expiry: Dict[str, float] = {}
+SESSION_TTL = 3600  # 1 hour
+
+def get_session_lock(call_sid: str) -> asyncio.Lock:
+    if call_sid not in session_locks:
+        session_locks[call_sid] = asyncio.Lock()
+    return session_locks[call_sid]
 
 # ─────────────────────────────────────────
-# STT — Sarvam saaras:v3
+# DATABASE (optimized with WAL mode)
 # ─────────────────────────────────────────
-SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
+DB_FILE = "gunivox.db"
 
-if SARVAM_API_KEY:
-    logger.info("✅ STT: Sarvam saaras:v3")
-else:
-    logger.warning("⚠️  No STT key found.")
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    # ⚡ OPT: Enable WAL mode for better concurrent read/write
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
+    
+    # Ensure columns exist (Migration)
+    c.execute("PRAGMA table_info(calls)")
+    cols = [col[1] for col in c.fetchall()]
+    if 'stage' not in cols:
+        c.execute("ALTER TABLE calls ADD COLUMN stage TEXT DEFAULT 'Cold Call'")
+    if 'duration_seconds' not in cols:
+        c.execute("ALTER TABLE calls ADD COLUMN duration_seconds INTEGER DEFAULT 0")
+    if 'billable_minutes' not in cols:
+        c.execute("ALTER TABLE calls ADD COLUMN billable_minutes REAL DEFAULT 0")
+    if 'ended_at' not in cols:
+        c.execute("ALTER TABLE calls ADD COLUMN ended_at TEXT")
 
-logger.info("✅ TTS configured for Sarvam Bulbul v2 (async httpx)")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS calls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            call_sid TEXT UNIQUE, 
+            phone_number TEXT, 
+            status TEXT,
+            started_at TEXT, 
+            ended_at TEXT,
+            duration_seconds INTEGER DEFAULT 0,
+            billable_minutes REAL DEFAULT 0,
+            end_reason TEXT, 
+            user_name TEXT,
+            interest TEXT, 
+            lead_status TEXT, 
+            follow_up TEXT, 
+            transcript TEXT,
+            stage TEXT DEFAULT 'Cold Call'
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS courses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT, 
+            institute TEXT,
+            duration TEXT,
+            fees TEXT, 
+            eligibility TEXT,
+            counsellor TEXT,
+            phone TEXT,
+            brochure_url TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS rag_documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT, content TEXT NOT NULL,
+            source TEXT, created_at TEXT
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_calls_phone ON calls(phone_number)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_calls_stage ON calls(stage)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_calls_sid ON calls(call_sid)")
+    conn.commit(); conn.close()
+    populate_default_courses()
+
+def _save_call_log_sync(call_sid: str, data: dict):
+    conn = sqlite3.connect(DB_FILE)
+    # ... rest of the function remains same but uses conn properly ...
 
 # ─────────────────────────────────────────
 # LLM
@@ -188,52 +263,29 @@ def populate_default_courses():
 
 init_db()
 
-# ═══════════════════════════════════════════════════════════════════════
-# CAG — Cache-Augmented Generation
-# The ENTIRE knowledge base (script + all courses) is baked into the
-# system message ONCE at startup and reused for every turn.
-# This eliminates the per-request FAISS vector search (~30-80 ms saved).
-# ═══════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────
+# System prompt cache
+# ─────────────────────────────────────────
 _system_prompt_cache: Optional[str] = None
-CAG_ENABLED = os.getenv("CAG_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 def _build_system_prompt() -> str:
-    """CAG: Build a rich system prompt with ALL course data embedded."""
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("SELECT name, institute, duration, fees, eligibility, counsellor, phone FROM courses")
-        rows = c.fetchall()
-        conn.close()
-        if rows:
-            course_lines = []
-            for r in rows:
-                name, institute, duration, fees, eligibility, counsellor, phone = r
-                course_lines.append(
-                    f"  • {name} | {institute} | {duration} | {fees} | "
-                    f"Eligibility: {eligibility} | Counsellor: {counsellor} ({phone})"
-                )
-            course_block = "\n".join(course_lines)
-        else:
-            course_block = "  (No courses in database yet)"
-
-        cag_note = (
-            "\n\n### [CAG — CACHED KNOWLEDGE BASE]\n"
-            "The following is the COMPLETE course catalogue. "
-            "Use this as the single source of truth. DO NOT retrieve externally.\n"
-            f"{course_block}"
-        )
-        full_prompt = SYSTEM_PROMPT + cag_note
-        logger.info(f"✅ CAG system prompt built | {len(rows)} courses embedded | {len(full_prompt)} chars")
-        return full_prompt
+        c.execute("SELECT name, description, fees FROM courses")
+        rows = c.fetchall(); conn.close()
+        course_text = "\n".join([f"- **{r[0]}:** {r[2]}. {r[1]}" for r in rows]) or "- No specific course data available."
+        return SYSTEM_PROMPT + "\n\n### ADDITIONAL COURSE DATA:\n" + course_text
     except Exception as e:
-        logger.error(f"CAG prompt build error: {e}")
+        logger.error(f"Prompt build error: {e}")
         return SYSTEM_PROMPT
 
-def get_system_prompt_with_courses() -> str:
+async def get_system_prompt_with_courses() -> str:
+    """BUG-9 FIX: Rebuilds prompt cache in executor to avoid blocking on cache miss."""
     global _system_prompt_cache
     if _system_prompt_cache is None:
-        _system_prompt_cache = _build_system_prompt()
+        loop = asyncio.get_running_loop()
+        _system_prompt_cache = await loop.run_in_executor(_executor, _build_system_prompt)
     return _system_prompt_cache
 
 def invalidate_prompt_cache():
@@ -273,11 +325,11 @@ METADATA_PATTERNS = {
 }
 
 # ─────────────────────────────────────────
-# ⚡ OPT-5: TTS audio LRU cache — bumped to 200 for CAG
+# ⚡ OPT-5: TTS audio LRU cache
 # Keyed by (text, lang) → static URL. Avoids Sarvam round-trip for repeated phrases.
 # ─────────────────────────────────────────
 _tts_cache: Dict[tuple, str] = {}
-_TTS_CACHE_MAX = 200  # ⚡ CAG-OPT: was 64
+_TTS_CACHE_MAX = 64
 
 def _tts_cache_get(text: str, lang: str) -> Optional[str]:
     return _tts_cache.get((text.strip(), lang))
@@ -325,6 +377,37 @@ def _save_call_log_sync(call_sid: str, data: dict):
                 billable = (int(diff + 29) // 30) * 0.5
                 data['billable_minutes'] = billable
                 
+def _save_call_log_sync(call_sid: str, data: dict):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT id, started_at, duration_seconds FROM calls WHERE call_sid = ?", (call_sid,))
+    row = c.fetchone()
+    
+    if not row:
+        # Initial insertion
+        c.execute("""
+            INSERT INTO calls (call_sid, phone_number, status, started_at, stage) 
+            VALUES (?,?,?,?,?)
+        """, (call_sid, data.get('phone_number'), 'initiated', datetime.now().isoformat(), data.get('stage', 'Cold Call')))
+    else:
+        # Update existing
+        allowed = ['status', 'end_reason', 'user_name', 'interest', 'lead_status', 'follow_up', 'transcript', 'stage', 'ended_at']
+        fields, values = [], []
+        
+        # Duration calculation if status is completed
+        status = data.get('status', '').lower()
+        if status in TERMINAL_CALL_STATUSES and row[1]:
+            ended_at = datetime.now()
+            data['ended_at'] = ended_at.isoformat()
+            try:
+                start_dt = datetime.fromisoformat(row[1])
+                diff = (ended_at - start_dt).total_seconds()
+                data['duration_seconds'] = int(diff)
+                
+                # Billing rounding: 1-30s -> 0.5, 31-60s -> 1.0 per minute
+                billable = (int(diff + 29) // 30) * 0.5
+                data['billable_minutes'] = billable
+                
                 allowed.extend(['duration_seconds', 'billable_minutes'])
             except Exception as e:
                 logger.error(f"Duration calc error: {e}")
@@ -342,36 +425,45 @@ def _save_call_log_sync(call_sid: str, data: dict):
     conn.close()
 
 def save_call_log(call_sid: str, data: dict):
-    _executor.submit(_save_call_log_sync, call_sid, data)
+    _db_executor.submit(_save_call_log_sync, call_sid, data)
 
-def export_db_to_excel(start_date=None, end_date=None):
-    conn = sqlite3.connect(DB_FILE); c = conn.cursor()
-    query = "SELECT * FROM calls"; params = []
-    if start_date and end_date:
-        query += " WHERE started_at BETWEEN ? AND ?"
-        params.extend([f"{start_date}T00:00:00", f"{end_date}T23:59:59"])
-    query += " ORDER BY id DESC"
-    c.execute(query, params); rows = c.fetchall()
-    columns = [d[0] for d in c.description]; conn.close()
-    wb = Workbook(); ws = wb.active; ws.title = "Call Logs"
-    ws.append(columns)
-    for row in rows: ws.append(row)
-    filename = "leads.xlsx"; wb.save(filename)
-    return filename
+async def _session_cleanup_task():
+    """HIGH: Memory leak prevention - cleanup old sessions every 10 mins."""
+    while True:
+        await asyncio.sleep(600)
+        now = time.time()
+        expired = [sid for sid, ts in session_expiry.items() if (now - ts) > SESSION_TTL]
+        for sid in expired:
+            sessions.pop(sid, None)
+            session_locks.pop(sid, None)
+            session_expiry.pop(sid, None)
+        if expired:
+            logger.info(f"🧹 Cleaned up {len(expired)} expired sessions.")
+
+# ⚡ OPT: Per-loop httpx client to avoid random 500s
+_httpx_clients: Dict[int, httpx.AsyncClient] = {}
+
+def _get_httpx_client() -> httpx.AsyncClient:
+    loop_id = id(asyncio.get_running_loop())
+    if loop_id not in _httpx_clients or _httpx_clients[loop_id].is_closed:
+        _httpx_clients[loop_id] = httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS)
+    return _httpx_clients[loop_id]
 
 def build_rag_context(query: str) -> str:
+    """BUG-5 FIX: Added timing log. Score filtering via faiss_rag.SCORE_THRESHOLD."""
     if not ENABLE_RAG or not faiss_rag.is_ready():
         return ""
+    _t = time.time()
     try:
-        logger.info(f"🔍 RAG query: {query}")
         results = faiss_rag.search(query, top_k=RAG_TOP_K)
-        logger.info(f"🔍 RAG results found: {len(results)}")
         if not results:
+            logger.info(f"⏱️ RAG: {(time.time()-_t)*1000:.0f}ms | hits=0")
             return ""
         parts = []
         for hit in results:
             ctx = hit.get('voice_context') or hit['text']
             parts.append(f"[score={hit['score']:.2f}]\n{ctx}")
+        logger.info(f"⏱️ RAG: {(time.time()-_t)*1000:.0f}ms | hits={len(results)}")
         return "\n\n".join(parts)
     except Exception as e:
         logger.error(f"FAISS search error: {e}")
@@ -414,33 +506,33 @@ async def transcribe_audio(audio_bytes: bytes, filename: str) -> str:
     return ""
 
 async def _transcribe_sarvam(audio_bytes: bytes, filename: str) -> str:
-    """Sarvam saaras:v3 via BytesIO — no disk write (⚡ OPT-2 applied to fallback too)."""
-    def _sync():
-        _t = time.time()
-        for attempt in range(2):
-            try:
-                url     = "https://api.sarvam.ai/speech-to-text"
-                payload = {'model': 'saaras:v3'}
-                headers = {'api-subscription-key': SARVAM_API_KEY}
-                audio_io = BytesIO(audio_bytes)
-                resp = requests.post(url, headers=headers, data=payload,
-                                     files=[('file', (filename, audio_io, 'audio/wav'))],
-                                     timeout=HTTP_TIMEOUT_SECONDS)
-                if resp.status_code == 200:
-                    transcript = resp.json().get("transcript", "").strip()
-                    logger.info(f"🎙️ Sarvam STT ({(time.time()-_t)*1000:.0f}ms): '{transcript}'")
-                    return transcript
-                if resp.status_code == 429 and attempt == 0:
-                    logger.warning("Sarvam STT 429 Rate Limit. Sleeping 1.5s...")
-                    time.sleep(1.5)
-                    continue
-                logger.error(f"Sarvam STT {resp.status_code}: {resp.text[:200]}")
-                return ""
-            except Exception as e:
-                logger.error(f"Sarvam STT error: {e}")
-                return ""
-        return ""
-    return await asyncio.get_running_loop().run_in_executor(_executor, _sync)
+    """BUG-6 FIX: True async STT via httpx — no executor thread blocked."""
+    _t = time.time()
+    for attempt in range(2):
+        try:
+            headers = {'api-subscription-key': SARVAM_API_KEY}
+            audio_io = BytesIO(audio_bytes)
+            client = _get_httpx_client()
+            resp = await client.post(
+                "https://api.sarvam.ai/speech-to-text",
+                headers=headers,
+                data={'model': 'saaras:v3'},
+                files=[('file', (filename, audio_io, 'audio/wav'))],
+            )
+            if resp.status_code == 200:
+                transcript = resp.json().get("transcript", "").strip()
+                logger.info(f"⏱️ STT: {(time.time()-_t)*1000:.0f}ms | '{transcript}'")
+                return transcript
+            if resp.status_code == 429 and attempt == 0:
+                logger.warning("Sarvam STT 429 Rate Limit. Async sleep 1.0s...")
+                await asyncio.sleep(1.0)
+                continue
+            logger.error(f"Sarvam STT {resp.status_code}: {resp.text[:200]}")
+            return ""
+        except Exception as e:
+            logger.error(f"Sarvam STT error: {e}")
+            return ""
+    return ""
 
 # ─────────────────────────────────────────
 # ⚡ OPT-3: LLM streaming helpers
@@ -503,6 +595,51 @@ async def _collect_llm_response(call_sid: str, messages: list,
             if delta:
                 buf.append(delta)
     return "".join(buf).strip()
+
+# Sentence boundary characters for Gujarati/Hindi/English
+_SENTENCE_BOUNDARIES = {'।', '.', '?', '!', '?'}
+
+async def _stream_llm_with_early_tts(call_sid: str, messages: list,
+                                      base_url: str, lang: str = "gu-IN",
+                                      temperature=0.7, max_tokens=120):
+    """
+    BUG-7 FIX: Stream LLM tokens, detect first sentence boundary,
+    fire TTS as background task immediately. Returns (full_text, first_tts_task, first_tts_text).
+    """
+    buf = []
+    first_sentence_fired = False
+    first_tts_task = None
+    first_tts_text = ""
+    _t = time.time()
+
+    async def _token_stream():
+        if AI_PROVIDER == "ollama":
+            async for chunk in _stream_ollama(messages, temperature, max_tokens):
+                yield chunk
+        else:
+            async for chunk in await aclient.chat.completions.create(
+                model=OPENAI_MODEL, messages=messages,
+                temperature=temperature, max_tokens=max_tokens, stream=True
+            ):
+                delta = chunk.choices[0].delta.content or ""
+                if delta:
+                    yield delta
+
+    async for token in _token_stream():
+        buf.append(token)
+        if not first_sentence_fired and any(c in token for c in _SENTENCE_BOUNDARIES):
+            partial = "".join(buf).strip()
+            text_match = TEXT_PATTERN.search(partial)
+            s1 = text_match.group(1).strip() if text_match else partial
+            s1 = re.sub(r'(LANG|STATUS|INTEREST|NAME|FOLLOW_UP):\s*\S+\s*\|?', '', s1).strip().strip('|').strip()
+            if len(s1) > 5:
+                first_tts_text = s1
+                first_tts_task = asyncio.create_task(generate_tts_audio(s1, base_url, lang))
+                first_sentence_fired = True
+                logger.info(f"⏱️ LLM_FIRST_S: {(time.time()-_t)*1000:.0f}ms | '{s1[:40]}...'")
+
+    full_text = "".join(buf).strip()
+    return full_text, first_tts_task, first_tts_text
 
 # ─────────────────────────────────────────
 # ⚡ OPT-4 + OPT-5: TTS — async httpx + LRU cache
@@ -597,32 +734,85 @@ async def _gtts_fallback(text: str, lang: str, BASE_URL: str) -> str:
 # ─────────────────────────────────────────
 PREWARM_PHRASES = [
     ("માફ કરશો, મને બરાબર સમજાયું નથી. શું તમે ફરીથી કહી શકશો?", "gu-IN"),
-    ("શું તમે કોલ પર છો?", "gu-IN"),
-    ("કોઈ જવાબ ન મળવાને કારણે અમે કોલ સમાપ્ત કરી રહ્યા છીએ. આવજો!", "gu-IN"),
-    ("તમારો દિવસ શુભ રહે, આવજો.", "gu-IN"),
-    ("સરસ! કૃપા કરીને તમારું latest qualification જણાવશો? 10th, 12th, કે Graduation?", "gu-IN"),
-    ("અને તમને કયા career fieldમાં રસ છે? જેમ કે Engineering, Management, Pharmacy, Design, Commerce, Science અથવા અન્ય Professional Courses.", "gu-IN"),
-    ("Perfect, કૃપા કરીને થોડી ક્ષણ લાઇન પર રહો, હું તમને અમારી counselling team સાથે transfer કરું છું જેથી તેઓ sessionની સંપૂર્ણ માહિતી શેર કરી શકે.", "gu-IN"),
-    ("ગણપત યુનિવર્સિટીના એડમિશનની ઇન્ક્વાયરી માટે સ્ટુડન્ટ તમારી સાથે વાત કરવા માંગે છે, હું કનેક્ટ કરી રહી છું.", "gu-IN"),
+    ("શું તમે હજી ત્યાં છો? કૃપા કરીને કંઈક બોલો.", "gu-IN"),
+    ("એવું લાગે છે કે તમે અત્યારે ઉપલબ્ધ નથી. અમે તમને પછીથી કોલ કરીશું. આવજો!", "gu-IN"),
+    ("તમારી પૂછપરછ માટે આભાર. શું હું બીજી કોઈ મદદ કરી શકું?", "gu-IN"),
+    ("ગણપત યુનિવર્સિટીમાં તમારો રસ લેવા બદલ આભાર.", "gu-IN"),
+    ("माफ़ करना, मुझे ठीक से समझ नहीं आया। क्या आप फिर से कह सकते हैं?", "hi-IN"),
+    ("क्या आप अभी भी वहां हैं? कृपया कुछ बोलें।", "hi-IN"),
+    ("Sorry, I didn't quite understand. Could you please repeat that?", "en-IN"),
     ("Are you still there? Please say something.", "en-IN"),
 ]
 
 async def _prewarm_tts():
-    """⚡ CAG-OPT: Pre-generate TTS for ALL scripted phrases at boot."""
-    await asyncio.sleep(3)  # wait for DB init to settle
-    base_url = BASE_URL or "http://localhost:8000"
-    tasks = [generate_tts_audio(text, base_url, lang) for text, lang in PREWARM_PHRASES]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    ok = sum(1 for r in results if isinstance(r, str) and r)
-    logger.info(f"🔥 TTS pre-warm complete: {ok}/{len(PREWARM_PHRASES)} phrases cached")
+    """Generate TTS for common phrases at boot so first real call doesn't pay the penalty."""
+    await asyncio.sleep(5)  # wait for FAISS and other init to settle
+    for text, lang in PREWARM_PHRASES:
+        try:
+            await generate_tts_audio(text, BASE_URL, lang) 
+            logger.info(f"🔥 Pre-warmed TTS: '{text[:40]}'")
+        except Exception as e:
+            logger.warning(f"TTS pre-warm failed for '{text[:30]}': {e}")
+
+async def _generate_greeting():
+    """BUG-1 FIX: Generate greeting.wav at startup so /vobiz-answer serves real audio."""
+    greeting_path = os.path.join("static", "audio", "greeting.wav")
+    if os.path.exists(greeting_path) and os.path.getsize(greeting_path) > 1000:
+        logger.info("✅ greeting.wav already exists — skipping generation.")
+        return
+
+    await asyncio.sleep(1)  # let httpx client init settle
+
+    greeting_text = (
+        "Hi, હું અનન્યા, Ganpat University તરફથી AI Career Assistant બોલું છું. "
+        "ઘણા વિદ્યાર્થીઓને 10મા, 12મા અથવા Graduation પછી યોગ્ય career પસંદ કરવામાં "
+        "મુશ્કેલી પડે છે. વિદ્યાર્થીઓને યોગ્ય માર્ગદર્શન આપવા માટે અમે તમારા શહેરમાં "
+        "FREE One-to-One Career Counselling Session આયોજન કરી રહ્યા છીએ. "
+        "શું તમને આ counselling sessionમાં જોડાવું ગમશે?"
+    )
+
+    if not SARVAM_API_KEY:
+        logger.warning("⚠️ No Sarvam key — cannot generate greeting.wav")
+        return
+
+    _t = time.time()
+    try:
+        client = _get_httpx_client()
+        payload = {
+            "text": greeting_text,
+            "target_language_code": "gu-IN",
+            "speaker": "anushka",
+            "model": "bulbul:v2",
+            "speech_sample_rate": 8000,
+            "enable_preprocessing": True,
+        }
+        headers = {
+            "api-subscription-key": SARVAM_API_KEY,
+            "Content-Type": "application/json",
+        }
+        resp = await client.post(
+            "https://api.sarvam.ai/text-to-speech",
+            json=payload, headers=headers
+        )
+        if resp.status_code == 200:
+            audio_b64 = resp.json()["audios"][0]
+            audio_bytes = base64.b64decode(audio_b64)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                _executor,
+                lambda: open(greeting_path, "wb").write(audio_bytes)
+            )
+            logger.info(f"✅ greeting.wav generated ({len(audio_bytes)} bytes, {(time.time()-_t)*1000:.0f}ms)")
+        else:
+            logger.error(f"❌ greeting.wav generation failed: Sarvam {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        logger.error(f"❌ greeting.wav generation error: {e}")
 
 @app.on_event("startup")
 async def startup_event():
-    # Build CAG prompt immediately
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(_executor, get_system_prompt_with_courses)
-    logger.info("✅ CAG system prompt loaded into memory")
+    asyncio.create_task(_generate_greeting())  # BUG-1: greeting.wav first
     asyncio.create_task(_prewarm_tts())
+    asyncio.create_task(_session_cleanup_task()) # HIGH: Start session memory cleanup
 
 # ─────────────────────────────────────────
 # AI RESPONSE — streaming LLM + parallel TTS kickoff
@@ -634,36 +824,42 @@ async def get_ai_response(call_sid: str, user_input: str) -> Dict[str, str]:
     Returns parsed ai_data dict; actual TTS is done in vobiz_respond.
     """
     if call_sid not in sessions:
-        sessions[call_sid] = [{"role": "system", "content": get_system_prompt_with_courses()}]
+        system_prompt = await get_system_prompt_with_courses()
+        sessions[call_sid] = [{"role": "system", "content": system_prompt}]
 
     sessions[call_sid].append({"role": "user", "content": user_input})
 
     try:
         request_messages = list(sessions[call_sid])
 
-        # ⚡ CAG: Knowledge base is already in the system prompt.
-        # Only run FAISS if CAG is disabled (fallback) — saves 30-80 ms per turn.
-        if not CAG_ENABLED:
-            rag_context = await asyncio.get_running_loop().run_in_executor(
-                _executor, build_rag_context, user_input
-            )
-            if rag_context:
-                request_messages.insert(1, {
-                    "role": "system",
-                    "content": (
-                        "Use this retrieved context as highest-priority factual grounding. "
-                        "If context conflicts with older memory, prefer retrieved context.\n\n"
-                        f"RETRIEVED_CONTEXT:\n{rag_context}"
-                    ),
-                })
+        # BUG-5 FIX: RAG on dedicated _faiss_executor (CPU-bound, won't starve I/O pool)
+        rag_context = await asyncio.get_running_loop().run_in_executor(
+            _faiss_executor, build_rag_context, user_input
+        )
+        if rag_context:
+            request_messages.insert(1, {
+                "role": "system",
+                "content": (
+                    "Use this retrieved context as highest-priority factual grounding. "
+                    "If context conflicts with older memory, prefer retrieved context.\n\n"
+                    f"RETRIEVED_CONTEXT:\n{rag_context}"
+                ),
+            })
 
-        # Stream LLM response
-        raw_text = await _collect_llm_response(call_sid, request_messages)
+        # BUG-7 FIX: Stream LLM with early TTS
+        _t_llm = time.time()
+        raw_text, early_tts_task, early_tts_text = await _stream_llm_with_early_tts(
+            call_sid, request_messages, BASE_URL,
+            lang="gu-IN",
+        )
+        logger.info(f"⏱️ LLM: {(time.time()-_t_llm)*1000:.0f}ms | call={call_sid[-8:]}")
 
         sessions[call_sid].append({"role": "assistant", "content": raw_text})
 
-        # Parse structured fields
-        ai_data = {"lang": "gu-IN", "text": raw_text}
+        # BUG-10 FIX: Optimized language detection with session caching
+        lang_key = f"__lang__{call_sid}"
+        ai_data = {"lang": sessions.get(lang_key, "gu-IN"), "text": raw_text}
+        
         lang_match = LANG_PATTERN.search(raw_text)
         text_match = TEXT_PATTERN.search(raw_text)
 
@@ -671,24 +867,8 @@ async def get_ai_response(call_sid: str, user_input: str) -> Dict[str, str]:
             detected_lang = lang_match.group(1).strip()
             if detected_lang in ["gu-IN", "hi-IN", "en-IN"]:
                 ai_data["lang"] = detected_lang
-            else:
-                # fallback to previous language or gu-IN
-                ai_data["lang"] = "gu-IN"
-                for msg in reversed(sessions[call_sid][:-1]):
-                    if msg["role"] == "assistant":
-                        prev_lang_match = LANG_PATTERN.search(msg["content"])
-                        if prev_lang_match and prev_lang_match.group(1).strip() in ["gu-IN", "hi-IN", "en-IN"]:
-                            ai_data["lang"] = prev_lang_match.group(1).strip()
-                            break
-        else:
-            # fallback to previous language
-            ai_data["lang"] = "gu-IN"
-            for msg in reversed(sessions[call_sid][:-1]):
-                if msg["role"] == "assistant":
-                    prev_lang_match = LANG_PATTERN.search(msg["content"])
-                    if prev_lang_match and prev_lang_match.group(1).strip() in ["gu-IN", "hi-IN", "en-IN"]:
-                        ai_data["lang"] = prev_lang_match.group(1).strip()
-                        break
+                sessions[lang_key] = detected_lang # Update cache
+        # If no match, ai_data["lang"] already contains the cached value from sessions.get()
         
         if text_match:
             ai_data["text"] = text_match.group(1).strip()
@@ -714,6 +894,9 @@ async def get_ai_response(call_sid: str, user_input: str) -> Dict[str, str]:
         metadata["transcript"] = json.dumps(clean_transcript)
         save_call_log(call_sid, metadata)
 
+        # Attach early TTS task info so vobiz_respond can use it efficiently
+        ai_data["_early_tts_task"] = early_tts_task
+        ai_data["_early_tts_text"] = early_tts_text
         return ai_data
 
     except Exception as e:
@@ -938,19 +1121,25 @@ async def _rescue_user_from_hold_loop(call_sid: str, base_url: str, all_busy: bo
 # ─────────────────────────────────────────
 async def download_recording_async(recording_url: str) -> bytes:
     """
-    ⚡ OPT-6: Single retry with 150 ms wait.
-    Original had 2 retries × 500 ms = 1 000 ms wasted on healthy providers.
+    BUG-4 FIX: True async download via httpx.AsyncClient.
+    No executor thread burned. Retry uses async sleep.
     """
-    def _dl():
-        headers = {"X-Auth-ID": VOBIZ_AUTH_ID, "X-Auth-Token": VOBIZ_AUTH_TOKEN}
-        resp = http_session.get(recording_url, headers=headers, timeout=HTTP_TIMEOUT_SECONDS)
+    _t = time.time()
+    headers = {"X-Auth-ID": VOBIZ_AUTH_ID, "X-Auth-Token": VOBIZ_AUTH_TOKEN}
+    client = _get_httpx_client()
+    try:
+        resp = await client.get(recording_url, headers=headers)
         if resp.status_code == 200 and len(resp.content) >= 500:
+            logger.info(f"⏱️ DOWNLOAD: {(time.time()-_t)*1000:.0f}ms | {len(resp.content)} bytes")
             return resp.content
-        # One retry after brief wait
-        time.sleep(0.15)
-        resp = http_session.get(recording_url, headers=headers, timeout=HTTP_TIMEOUT_SECONDS)
+        # One retry after brief async wait
+        await asyncio.sleep(0.1)
+        resp = await client.get(recording_url, headers=headers)
+        logger.info(f"⏱️ DOWNLOAD: {(time.time()-_t)*1000:.0f}ms | {len(resp.content)} bytes (retry)")
         return resp.content if resp.status_code == 200 else b""
-    return await asyncio.get_running_loop().run_in_executor(_executor, _dl)
+    except Exception as e:
+        logger.error(f"Download error: {e}")
+        return b""
 
 # ─────────────────────────────────────────
 # VOBIZ WEBHOOK ENDPOINTS
@@ -973,10 +1162,13 @@ async def vobiz_answer(request: Request):
     
     # We still keep the text for session initialization
     greeting_text = "Hi, હું અનન્યા, Ganpat University તરફથી AI Career Assistant બોલું છું. ઘણા વિદ્યાર્થીઓને 10મા, 12મા અથવા Graduation પછી યોગ્ય career પસંદ કરવામાં મુશ્કેલી પડે છે. વિદ્યાર્થીઓને યોગ્ય માર્ગદર્શન આપવા માટે અમે તમારા શહેરમાં FREE One-to-One Career Counselling Session આયોજન કરી રહ્યા છીએ. શું તમને આ counselling sessionમાં જોડાવું ગમશે?"
-    sessions[call_sid] = [
-        {"role": "system", "content": get_system_prompt_with_courses()},
-        {"role": "assistant", "content": f"TEXT: {greeting_text} | LANG: gu-IN"}
-    ]
+    # ⚡ OPT: Session locking & Expiry update
+    async with get_session_lock(call_sid):
+        session_expiry[call_sid] = time.time()
+        sessions[call_sid] = [
+            {"role": "system", "content": await get_system_prompt_with_courses()},
+            {"role": "assistant", "content": f"TEXT: {greeting_text} | LANG: gu-IN"}
+        ]
 
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -993,24 +1185,25 @@ async def vobiz_answer(request: Request):
 
 @app.api_route("/vobiz-respond", methods=["GET", "POST"])
 async def vobiz_respond(request: Request):
-    """
-    ⚡ Optimized hot path:
-      1. Download (⚡ OPT-6: 1 retry × 150 ms)
-      2. STT     (⚡ OPT-2: BytesIO)
-      3. RAG     (already concurrent inside get_ai_response)
-      4. LLM     (⚡ OPT-3: streaming)
-      5. TTS     (⚡ OPT-4: async httpx; OPT-5: cache)
-    """
     logger.info("🗣️  /vobiz-respond")
+    
+    # ⚡ OPT: Early session locking
+    form_data = {}
     try:
         form_data = dict(await request.form())
-    except Exception:
-        form_data = {}
+    except: pass
     if not form_data:
-        try:
-            form_data = await request.json()
-        except Exception:
-            form_data = {}
+        try: form_data = await request.json()
+        except: pass
+
+    call_sid = (form_data.get("CallUUID") or form_data.get("request_uuid")
+                or form_data.get("CallSid") or "unknown_session")
+    
+    async with get_session_lock(call_sid):
+        session_expiry[call_sid] = time.time()
+        return await _vobiz_respond_logic(request, form_data, call_sid)
+
+async def _vobiz_respond_logic(request: Request, form_data: dict, call_sid: str):
 
     recording_url = (form_data.get("RecordUrl") or form_data.get("RecordFile")
                      or form_data.get("RecordingUrl") or form_data.get("recording_url"))
@@ -1029,48 +1222,62 @@ async def vobiz_respond(request: Request):
             ext      = ".mp3" if recording_url.lower().endswith(".mp3") else ".wav"
             filename = f"rec_{call_sid}{ext}"
             
-            # Simple silence/hallucination filter based on low audio volume (WAV only)
+            # BUG-2 FIX: Convert G.711 A-law/U-law → PCM WAV via ffmpeg before silence detection.
+            # This ensures wave.open() always works — no more unreliable byte-variance fallback.
             is_silent = False
             if ext == ".wav":
+                _t_sd = time.time()
                 try:
                     import wave, io, struct
-                    with wave.open(io.BytesIO(audio_bytes), 'rb') as w:
-                        frames = w.readframes(w.getnframes())
-                        width = w.getsampwidth()
-                        if width in (1, 2):
-                            fmt = '<' + ('h' if width==2 else 'b') * (len(frames)//width)
-                            samples = struct.unpack(fmt, frames)
-                            max_amp = max(abs(s) for s in samples[::20]) if samples else 0
-                            logger.info(f"   WAV max amplitude: {max_amp}")
-                            if max_amp < 2000:  # raised a bit to filter strong static
-                                is_silent = True
+                    # Convert any codec (G.711 A-law/U-law/PCM) to guaranteed PCM s16le
+                    proc = await asyncio.create_subprocess_exec(
+                        "ffmpeg", "-i", "pipe:0",
+                        "-ar", "16000", "-ac", "1",
+                        "-f", "wav", "-acodec", "pcm_s16le", "pipe:1",
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    pcm_bytes, _ = await proc.communicate(input=audio_bytes)
+
+                    if pcm_bytes and len(pcm_bytes) > 100:
+                        # Now wave.open() will always succeed on PCM data
+                        with wave.open(io.BytesIO(pcm_bytes), 'rb') as w:
+                            frames = w.readframes(w.getnframes())
+                            width = w.getsampwidth()
+                            if width in (1, 2):
+                                fmt = '<' + ('h' if width == 2 else 'b') * (len(frames) // width)
+                                samples = struct.unpack(fmt, frames)
+                                max_amp = max(abs(s) for s in samples[::20]) if samples else 0
+                                logger.info(f"   WAV max amplitude: {max_amp}")
+                                if max_amp < 2000:
+                                    is_silent = True
+                        # Use PCM bytes for STT too — cleaner input for Sarvam
+                        audio_bytes = pcm_bytes
+                    else:
+                        logger.warning("   ffmpeg PCM conversion returned empty — skipping silence check")
+                except FileNotFoundError:
+                    logger.warning("   ffmpeg not found — skipping silence detection (raw audio sent to STT)")
                 except Exception as e:
-                    # Fallback for G.711 A-law / U-law where wave module fails 
-                    # due to unsupported compression type or missing header constraint.
-                    if len(audio_bytes) > 200:
-                        import statistics
-                        # Sample 2000 bytes from the middle to avoid any headers
-                        mid = len(audio_bytes) // 2
-                        sample_bytes = audio_bytes[mid:mid+2000] if len(audio_bytes) > 4000 else audio_bytes[44:]
-                        variance = statistics.variance(sample_bytes)
-                        max_val_range = max(sample_bytes) - min(sample_bytes) if sample_bytes else 0
-                        logger.info(f"   WAV extraction failed ({e}). Fallback byte variance: {variance:.1f}, Range: {max_val_range}")
-                        
-                        # Pure A-law / U-law silence has near 0 variance. 
-                        # Light static stays under ~500. Human voice pushes variance > 3000.
-                        if variance < 800:
-                            is_silent = True
+                    logger.warning(f"   Silence detection error: {e} — skipping (raw audio sent to STT)")
+                logger.info(f"⏱️ SILENCE_DET: {(time.time()-_t_sd)*1000:.0f}ms | call={call_sid[-8:]}")
 
             if is_silent:
                 logger.info("   Background noise detected (silent), skipping STT API to avoid hallucination.")
                 user_speech = ""
             else:
                 user_speech = await transcribe_audio(audio_bytes, filename)
+                # BUG-3 FIX: Length-based filter + genuine STT artifacts only.
+                # "ok"/"okay" removed — they are valid caller agreement responses.
                 _clean = re.sub(r'[^\w\s]', '', user_speech.lower()).strip()
-                hallucinations = {"data factor is a problem", "data science research", "okay", "ok", "हाँ जी हाँ जी हाँ हाँ"}
-                if _clean in hallucinations or "bumped" in _clean or "mimm" in _clean or "હરલ ળાલ" in _clean:
-                    logger.info(f"   Hallucination dropped: '{user_speech}'")
+                if len(_clean) < 2:
+                    logger.info(f"   Too short, dropped: '{user_speech}'")
                     user_speech = ""
+                else:
+                    hallucinations = {"data factor is a problem", "data science research", "हाँ जी हाँ जी हाँ हाँ"}
+                    if _clean in hallucinations or "bumped" in _clean or "mimm" in _clean or "હરલ ળાલ" in _clean:
+                        logger.info(f"   Hallucination dropped: '{user_speech}'")
+                        user_speech = ""
         else:
             logger.warning(f"   Recording too small ({len(audio_bytes)} bytes) — skipping STT.")
 
@@ -1084,22 +1291,49 @@ async def vobiz_respond(request: Request):
     sessions.pop(f"__silence__{call_sid}", None)
 
     # ── LLM (get_ai_response already does RAG concurrently inside) ────────────
+    t_start = time.time()
     ai_data = await get_ai_response(call_sid, user_speech)
     lang    = ai_data.get("lang", "gu-IN")
     text    = ai_data.get("text", "માફ કરશો, મને બરાબર સમજાયું નથી. શું તમે ફરીથી કહી શકશો?")
+    early_tts_task = ai_data.get("_early_tts_task")
+    early_tts_text = ai_data.get("_early_tts_text", "")
 
     should_hangup   = "[HANGUP]"   in text or "HANGUP"   in ai_data.get("text", "")
     should_transfer = "[TRANSFER]" in text or "TRANSFER" in ai_data.get("text", "")
     text = text.replace("[HANGUP]", "").replace("[TRANSFER]", "").strip()
 
-    # ── TTS (⚡ OPT-4 async + OPT-5 cache) ───────────────────────────────────
+    # ── TTS Optimization ─────────────────────────────────────────────────────
+    _t_tts = time.time()
+    audio_url = None
+
+    if not (should_transfer or should_hangup):
+        # ⚡ OPT: Substring/Prefix matching for early TTS reuse (multi-sentence fix)
+        if early_tts_task and early_tts_text and text.startswith(early_tts_text):
+            audio_url = await early_tts_task
+            logger.info(f"⏱️ TURN_TTS: {(time.time()-_t_tts)*1000:.0f}ms (Reused early prefix)")
+        else:
+            if early_tts_task and not early_tts_task.done():
+                early_tts_task.cancel()
+            audio_url = await generate_tts_audio(text, get_base_url(request), lang)
+            logger.info(f"⏱️ TURN_TTS: {(time.time()-_t_tts)*1000:.0f}ms (Full generation)")
+
+    # ── XML Generation ────────────────────────────────────────────────────────
     if should_transfer:
         xml = await transfer_xml(request, text, call_sid, lang=lang)
     elif should_hangup:
         xml = await hangup_xml(request, text, lang=lang)
+    elif audio_url:
+        BASE_URL = get_base_url(request)
+        xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Play>{audio_url}</Play>
+    <Record action="{BASE_URL}/vobiz-respond" method="POST" maxLength="15" timeout="1" playBeep="false" />
+    <Redirect method="POST">{BASE_URL}/vobiz-silent</Redirect>
+</Response>"""
     else:
         xml = await gather_xml(request, text, action_path="vobiz-respond", lang=lang)
 
+    logger.info(f"⏱️ TOTAL_TURN: {(time.time()-t_start)*1000:.0f}ms | call={call_sid[-8:]}")
     return Response(content=xml, media_type="text/xml", headers=get_cloudflare_headers())
 
 
@@ -1133,14 +1367,17 @@ async def call_status(request: Request):
                   or form_data.get("Reason"))
 
     if call_sid:
-        update = {"status": status}
-        if end_reason:
-            update["end_reason"] = end_reason
-        save_call_log(call_sid, update)
-        terminal = {"completed", "busy", "no-answer", "canceled", "failed", "hangup"}
-        if status.lower() in terminal:
-            sessions.pop(call_sid, None)
-            sessions.pop(f"__silence__{call_sid}", None)
+        async with get_session_lock(call_sid):
+            update = {"status": status}
+            if end_reason:
+                update["end_reason"] = end_reason
+            save_call_log(call_sid, update)
+            terminal = {"completed", "busy", "no-answer", "canceled", "failed", "hangup"}
+            if status.lower() in terminal:
+                sessions.pop(call_sid, None)
+                session_locks.pop(call_sid, None)
+                session_expiry.pop(call_sid, None)
+                sessions.pop(f"__silence__{call_sid}", None)
 
     return JSONResponse(content={"received": True})
 
@@ -1890,6 +2127,22 @@ def _serve_frontend_index():
 @app.head("/")
 async def serve_root():
     return _serve_frontend_index()
+
+# ─────────────────────────────────────────
+# UNMUTE (Real-time Voice-to-Voice)
+# ─────────────────────────────────────────
+from unmute_handler import run_unmute_pipeline
+
+@app.websocket("/unmute")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    logger.info("⚡ Unmute connection accepted.")
+    try:
+        await run_unmute_pipeline(websocket)
+    except Exception as e:
+        logger.error(f"Unmute error: {e}")
+    finally:
+        logger.info("⚡ Unmute connection closed.")
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "HEAD"])
 async def catch_all(request: Request, path: str):
