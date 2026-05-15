@@ -132,7 +132,19 @@ const App: React.FC = () => {
   const [searchQuery, setSearchQuery] = useState("");
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
+  const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
+  const [debouncedStartDate, setDebouncedStartDate] = useState("");
+  const [debouncedEndDate, setDebouncedEndDate] = useState("");
   const [selectedLog, setSelectedLog] = useState<CallLog | null>(null);
+
+  useEffect(() => {
+    const handler = setTimeout(() => {
+      setDebouncedSearchQuery(searchQuery);
+      setDebouncedStartDate(startDate);
+      setDebouncedEndDate(endDate);
+    }, 500);
+    return () => clearTimeout(handler);
+  }, [searchQuery, startDate, endDate]);
 
   // Course State
   interface Course {
@@ -269,9 +281,9 @@ const App: React.FC = () => {
     try {
       const res = await api.get(`/api/calls`, {
         params: {
-          q: searchQuery,
-          start_date: startDate,
-          end_date: endDate
+          q: debouncedSearchQuery,
+          start_date: debouncedStartDate,
+          end_date: debouncedEndDate
         }
       });
       // console.log("Fetched Logs:", res.data);
@@ -284,7 +296,7 @@ const App: React.FC = () => {
   const fetchStats = async () => {
     try {
       const res = await api.get(`/api/stats`, {
-        params: { start_date: startDate, end_date: endDate }
+        params: { start_date: debouncedStartDate, end_date: debouncedEndDate }
       });
       setStats(res.data);
     } catch (err) {
@@ -421,7 +433,7 @@ const App: React.FC = () => {
       interval = setInterval(fetchMinutesData, 5000);
     }
     return () => clearInterval(interval);
-  }, [activeView, searchQuery, startDate, endDate]); // Re-fetch logs when search or date changes
+  }, [activeView, debouncedSearchQuery, debouncedStartDate, debouncedEndDate]); // Re-fetch logs when search or date changes
 
   // Poll for Active Call Status & Transcript
   useEffect(() => {
